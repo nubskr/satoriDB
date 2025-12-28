@@ -1,786 +1,790 @@
 # SatoriDB Architecture
 
-SatoriDB is an embedded vector database for approximate nearest neighbor (ANN) search.
-It runs entirely in-process and persists vector data to Walrus, a topic-based storage engine.
+## Overview
+
+SatoriDB is a billion-scale embedded vector database with a two-tier architecture:
+
+1. **Tier 1 - Routing (in-memory):** HNSW index over quantized bucket centroids
+2. **Tier 2 - Scanning (on-disk):** Parallel bucket scanning with exact L2 distance
+
+The design achieves 95%+ recall at billion-vector scale on a single machine by trading routing precision for throughput—the router finds *candidate buckets* approximately, then exact scanning finds the actual nearest neighbors.
+
+```
+Query flow:
+
+  Query vector
+       │
+       ▼
+  ┌─────────────────────────┐
+  │  Router (HNSW, 8-bit)   │  ← Tier 1: "which ~500 buckets to probe?"
+  └───────────┬─────────────┘
+              │
+              ▼
+  ┌─────────────────────────┐
+  │  Parallel Bucket Scan   │  ← Tier 2: exact L2 on ~1M vectors
+  │  (N workers, cached)    │
+  └───────────┬─────────────┘
+              │
+              ▼
+       Top-K results
+```
 
 ---
 
-## System Overview
+## Component Architecture
 
 ```
-                                 ┌─────────────────────────────────────────────────────────────┐
-                                 │                        SatoriDB                             │
-                                 └─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              SatoriDb                                   │
+│                  (lifecycle, public API, thread ownership)              │
+└─────────────────────────────────────┬───────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            SatoriHandle                                 │
+│                    (cloneable, stateless coordinator)                   │
+└────┬──────────────────┬──────────────────┬──────────────────┬───────────┘
+     │                  │                  │                  │
+     ▼                  ▼                  ▼                  ▼
+┌──────────────┐  ┌───────────────┐  ┌───────────────┐  ┌─────────────────┐
+│RouterManager │  │ HashRing      │  │ Workers (N)   │  │ RebalanceWorker │
+│(1 thread)    │  │ (stateless)   │  │ (N threads)   │  │ (1 thread)      │
+├──────────────┤  ├───────────────┤  ├───────────────┤  ├─────────────────┤
+│ HNSW index   │  │ bucket →      │  │ query exec    │  │ split/merge     │
+│ centroids    │  │ worker shard  │  │ upsert        │  │ delete          │
+│ quantizer    │  │               │  │ LRU cache     │  │ centroid track  │
+└──────┬───────┘  └───────────────┘  └───────┬───────┘  └────────┬────────┘
+       │                                     │                   │
+       │                                     ▼                   │
+       │         ┌───────────────────────────────────────────────┼────────┐
+       │         │                   Storage                     │        │
+       │         ├───────────────────────────────────────────────┴────────┤
+       │         │                    Walrus (WAL)                        │
+       │         │               (topic per bucket, io_uring)             │
+       │         └───────────────────────────┬────────────────────────────┘
+       │                                     │
+       │         ┌───────────────────────────┴────────────────────────────┐
+       │         │                                                        │
+       │         ▼                                                        ▼
+       │  ┌─────────────────────┐                            ┌─────────────────────┐
+       │  │    VectorIndex      │                            │    BucketIndex      │
+       │  │     (RocksDB)       │                            │     (RocksDB)       │
+       │  ├─────────────────────┤                            ├─────────────────────┤
+       │  │ vector_id → vector  │                            │ vector_id → bucket  │
+       │  └─────────────────────┘                            └─────────────────────┘
+       │
+       ▼
+┌──────────────────┐
+│  RoutingTable    │
+│  (lock-free Arc) │
+├──────────────────┤
+│ atomic version   │
+│ RwLock<Router>   │
+│ changed buckets  │
+└──────────────────┘
+       ▲
+       │
+  (workers snapshot
+   for cache invalidation)
+```
+
+---
+
+## Communication Patterns
+
+### Channels Everywhere
+
+Components communicate via message passing, not shared mutable state:
+
+```
+SatoriHandle ──crossbeam channel──► RouterManager
+             ──async_channel──────► Workers[0..N]
+             ──async_channel──────► RebalanceWorker
+```
+
+Each component follows the same pattern:
+
+```rust
+loop {
+    match receiver.recv().await {
+        Message::DoThing { respond_to } => {
+            let result = do_thing();
+            respond_to.send(result);
+        }
+        Message::Shutdown { respond_to } => {
+            respond_to.send(());
+            break;
+        }
+    }
+}
+```
+
+### Single Writer Principle
+
+Every piece of mutable state has exactly one writer:
+
+| State | Owner | Others |
+|-------|-------|--------|
+| HNSW index | RouterManager | read via RoutingTable snapshot |
+| Worker cache | Worker (per-thread) | nobody else |
+| Centroids map | RebalanceWorker | RouterManager reads via channel |
+| WAL | Walrus (append-only) | readers don't conflict |
+
+### Version-Based Invalidation
+
+No explicit cache invalidation messages. Workers detect staleness via version numbers:
+
+```rust
+// RoutingTable
+pub fn install(&self, router: Router, changed_buckets: Vec<u64>) -> u64 {
+    let next = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+    *self.router.write() = Some(RoutingData { router, changed });
+    next
+}
+
+// Executor (in worker)
+if self.cache_version.load() != routing_version {
+    cache.invalidate_many(&changed_buckets);
+    self.cache_version.store(routing_version);
+}
+```
+
+```
+  Time ─────────────────────────────────────────────────────────────────────►
+
+  RoutingTable        │ version=1 │     │ version=2 │         │ version=3 │
+  version             └───────────┘     └───────────┘         └───────────┘
+                                              │
+  RebalanceWorker                             │
+  splits bucket 42  ──────────────────────────┴────► install(router, [42, A, B])
                                                             │
-                         ┌──────────────────────────────────┼──────────────────────────────────┐
-                         │                                  │                                  │
-                         ▼                                  ▼                                  ▼
-              ┌────────────────────┐             ┌────────────────────┐             ┌────────────────────┐
-              │   SatoriHandle     │             │   Router Manager   │             │     Rebalancer     │
-              │      (API)         │             │     (Thread)       │             │     (Thread)       │
-              │                    │             │                    │             │                    │
-              │  • query()         │────────────▶│  • HNSW Router     │             │  • Monitor sizes   │
-              │  • insert()        │             │  • Bucket metadata │             │  • Split buckets   │
-              │  • flush()         │             │  • Centroid mgmt   │             │  • K-means (k=2)   │
-              └────────────────────┘             └────────────────────┘             └────────────────────┘
-                         │
-                         │
-                         ▼
-              ┌─────────────────────────────────────────────────────────────────────────────────────────┐
-              │                              Consistent Hash Ring                                       │
-              │                            bucket_id  ───▶  worker_shard                                │
-              └─────────────────────────────────────────────────────────────────────────────────────────┘
-                         │
-         ┌───────────────┼───────────────┬───────────────┬───────────────┐
-         │               │               │               │               │
-         ▼               ▼               ▼               ▼               ▼
-   ┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐
-   │  Worker 0 │   │  Worker 1 │   │  Worker 2 │   │  Worker 3 │   │  Worker N │
-   │  (CPU 0)  │   │  (CPU 1)  │   │  (CPU 2)  │   │  (CPU 3)  │   │  (CPU N)  │
-   │           │   │           │   │           │   │           │   │           │
-   │  Glommio  │   │  Glommio  │   │  Glommio  │   │  Glommio  │   │  Glommio  │
-   │  Executor │   │  Executor │   │  Executor │   │  Executor │   │  Executor │
-   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
-         │               │               │               │               │
-         └───────────────┴───────────────┴───────┬───────┴───────────────┘
-                                                 │
-                                                 ▼
-              ┌─────────────────────────────────────────────────────────────────────────────────────────┐
-              │                                                                                         │
-              │                                   Storage Layer                                         │
-              │                                                                                         │
-              │    ┌─────────────────────────────────────────────────────────────────────────────┐     │
-              │    │                              Walrus                                          │     │
-              │    │                     (Core Storage Engine)                                    │     │
-              │    │                                                                              │     │
-              │    │   Topic-based append-only storage for bucket/cluster data                   │     │
-              │    │   • io_uring batch I/O (Linux)                                              │     │
-              │    │   • 10MB blocks, 1GB files                                                  │     │
-              │    │   • FNV-1a checksums                                                        │     │
-              │    └─────────────────────────────────────────────────────────────────────────────┘     │
-              │                                                                                         │
-              │    ┌────────────────────────────┐       ┌────────────────────────────┐                 │
-              │    │       VectorIndex          │       │       BucketIndex          │                 │
-              │    │        (RocksDB)           │       │        (RocksDB)           │                 │
-              │    │     id ──▶ vector          │       │     id ──▶ bucket_id       │                 │
-              │    └────────────────────────────┘       └────────────────────────────┘                 │
-              │                                                                                         │
-              └─────────────────────────────────────────────────────────────────────────────────────────┘
-```
+                                                     changed_buckets = [42]
+                                                            │
+                                                            ▼
+  ┌───────────────────────────────────────────────────────────────────────────┐
+  │                                                                           │
+  │   Worker 0 (cache_version=1)          Worker 1 (cache_version=1)          │
+  │                                                                           │
+  │   on next query:                      on next query:                      │
+  │   ┌──────────────────────────┐        ┌──────────────────────────┐        │
+  │   │ routing_version = 2      │        │ routing_version = 2      │        │
+  │   │ cache_version = 1        │        │ cache_version = 1        │        │
+  │   │                          │        │                          │        │
+  │   │ 2 != 1 → stale!          │        │ 2 != 1 → stale!          │        │
+  │   │                          │        │                          │        │
+  │   │ invalidate bucket 42     │        │ invalidate bucket 42     │        │
+  │   │ cache_version = 2        │        │ cache_version = 2        │        │
+  │   └──────────────────────────┘        └──────────────────────────┘        │
+  │                                                                           │
+  └───────────────────────────────────────────────────────────────────────────┘
 
----
-
-## Core Concepts
-
-### Buckets (Clusters)
-
-Vectors are organized into **buckets** - clusters of similar vectors. Each bucket has:
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                           Bucket                                     │
-├──────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   ID:        42                                                      │
-│   Centroid:  [0.12, 0.45, 0.78, 0.33, ...]   ◄── mean of all vectors│
-│   Count:     1,847                                                   │
-│                                                                      │
-│   Vectors (stored in Walrus topic "bucket_42"):                      │
-│   ┌────────────────────────────────────────────────────────────┐    │
-│   │  id: 1001  │  [0.11, 0.44, 0.79, 0.32, ...]               │    │
-│   ├────────────────────────────────────────────────────────────┤    │
-│   │  id: 1002  │  [0.13, 0.46, 0.77, 0.34, ...]               │    │
-│   ├────────────────────────────────────────────────────────────┤    │
-│   │  id: 1003  │  [0.12, 0.45, 0.78, 0.33, ...]               │    │
-│   ├────────────────────────────────────────────────────────────┤    │
-│   │    ...     │              ...                              │    │
-│   └────────────────────────────────────────────────────────────┘    │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-### Two-Tier Search Architecture
-
-```
-                              ┌───────────────────┐
-                              │    Query Vector   │
-                              │  [0.1, 0.2, ...]  │
-                              └─────────┬─────────┘
-                                        │
-                    ════════════════════╪════════════════════
-                         TIER 1: ROUTING (Router Manager)
-                    ════════════════════╪════════════════════
-                                        │
-                                        ▼
-                    ┌───────────────────────────────────────┐
-                    │             HNSW Index                │
-                    │       (over bucket centroids)         │
-                    │                                       │
-                    │   Quantized to u8, cosine distance    │
-                    │   M=24, ef_construction=180           │
-                    │                                       │
-                    │   Input:  query vector, top_k=200     │
-                    │   Output: [bucket_12, bucket_47, ...] │
-                    └───────────────────────────────────────┘
-                                        │
-                                        ▼
-                    ┌───────────────────────────────────────┐
-                    │      Selected Bucket IDs              │
-                    │   [12, 47, 89, 103, 156, 201, ...]    │
-                    └───────────────────────────────────────┘
-                                        │
-                    ════════════════════╪════════════════════
-                        TIER 2: SCANNING (Workers)
-                    ════════════════════╪════════════════════
-                                        │
-              ┌─────────────────────────┼─────────────────────────┐
-              │                         │                         │
-              ▼                         ▼                         ▼
-     ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-     │    Worker 0     │       │    Worker 1     │       │    Worker 2     │
-     │                 │       │                 │       │                 │
-     │  Buckets:       │       │  Buckets:       │       │  Buckets:       │
-     │  [12, 89, 201]  │       │  [47, 156]      │       │  [103]          │
-     │                 │       │                 │       │                 │
-     │  For each:      │       │  For each:      │       │  For each:      │
-     │  1. Load from   │       │  1. Load from   │       │  1. Load from   │
-     │     Walrus      │       │     Walrus      │       │     Walrus      │
-     │  2. L2 scan     │       │  2. L2 scan     │       │  2. L2 scan     │
-     │  3. Return      │       │  3. Return      │       │  3. Return      │
-     │     top-100     │       │     top-100     │       │     top-100     │
-     └────────┬────────┘       └────────┬────────┘       └────────┬────────┘
-              │                         │                         │
-              └─────────────────────────┼─────────────────────────┘
-                                        │
-                                        ▼
-                    ┌───────────────────────────────────────┐
-                    │         Merge & Sort Results          │
-                    │                                       │
-                    │    Sort all candidates by distance    │
-                    │    Return final top_k to caller       │
-                    └───────────────────────────────────────┘
-```
-
----
-
-## Component Details
-
-### Router Manager
-
-Single-threaded component that manages bucket metadata and the HNSW routing index:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Router Manager                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────────────────────┐      ┌─────────────────────────────────┐  │
-│  │      Bucket Metadata        │      │          HNSW Router            │  │
-│  │                             │      │                                 │  │
-│  │  HashMap<bucket_id,         │      │  • Stores quantized centroids  │  │
-│  │    BucketMeta {             │─────▶│  • Hierarchical graph layers   │  │
-│  │      id: u64,               │      │  • Cosine similarity search    │  │
-│  │      centroid: Vec<f32>,    │      │                                 │  │
-│  │      count: u64,            │      │  Query: O(log N) bucket lookup │  │
-│  │    }                        │      │                                 │  │
-│  │  >                          │      └─────────────────────────────────┘  │
-│  └─────────────────────────────┘                                            │
-│                                                                             │
-│  Centroid update formula (running mean):                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  new_centroid[i] = (old_centroid[i] * count + vector[i]) / (count+1)│   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  Persisted to Walrus topics:                                                │
-│    • "router_snapshot" ─── full bucket state                               │
-│    • "router_updates"  ─── incremental centroid updates                    │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Workers
-
-Each worker runs a Glommio executor pinned to a CPU:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Worker Architecture                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                         Glommio Executor                             │   │
-│  │                    (io_uring async runtime)                          │   │
-│  │                                                                      │   │
-│  │   • CPU-pinned for cache locality                                   │   │
-│  │   • Bounded message channel (capacity: 1000)                        │   │
-│  │   • Max 32 concurrent query tasks                                   │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                           LRU Cache                                  │   │
-│  │                                                                      │   │
-│  │   Caches hot bucket data to avoid repeated Walrus reads             │   │
-│  │                                                                      │   │
-│  │   Default config:                                                   │   │
-│  │     • max_buckets: 64                                               │   │
-│  │     • max_bytes_per_bucket: 64 MB                                   │   │
-│  │     • total: ~4 GB arena                                            │   │
-│  │                                                                      │   │
-│  │   Eviction: LRU with routing-version invalidation                   │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  Message Types:                                                             │
-│    ├── Query   ──▶ search buckets, return (id, distance) pairs            │
-│  │    ├── Upsert  ──▶ persist single vector                                 │
-│    ├── Ingest ──▶ batch persist (with duplicate detection)                │
-│    ├── Flush  ──▶ drain pending writes                                    │
-│    └── FetchVectors ──▶ retrieve by ID                                    │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Consistent Hash Ring
-
-Maps bucket IDs to worker shards:
-
-```
-                          Consistent Hash Ring
-            ┌──────────────────────────────────────────────┐
-            │                                              │
-            │                  ┌─────┐                     │
-            │             ┌────┤ W0  ├────┐                │
-            │        ┌────┘    └─────┘    └────┐           │
-            │   ┌────┘                        └────┐      │
-            │ ┌─────┐                            ┌─────┐  │
-            │ │ W3  │                            │ W1  │  │
-            │ └─────┘                            └─────┘  │
-            │   └────┐                        ┌────┘      │
-            │        └────┐    ┌─────┐    ┌────┘           │
-            │             └────┤ W2  ├────┘                │
-            │                  └─────┘                     │
-            │                                              │
-            │   hash(bucket_id) lands on ring              │
-            │   → assigned to next clockwise worker        │
-            │                                              │
-            │   Virtual nodes per worker: 8 (default)      │
-            │                                              │
-            └──────────────────────────────────────────────┘
-
-    Code: src/tasks.rs:23-50
-```
-
----
-
-## Storage Layer
-
-### Walrus - Core Storage Engine
-
-Walrus is a topic-based append-only storage engine that stores all bucket/cluster data:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                  Walrus                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Topics (one per bucket + system topics):                                   │
-│                                                                             │
-│    bucket_0          ──▶  [entry][entry][entry][entry]...                  │
-│    bucket_1          ──▶  [entry][entry]...                                │
-│    bucket_42         ──▶  [entry][entry][entry][entry][entry]...           │
-│    bucket_103        ──▶  [entry][entry][entry]...                         │
-│    router_snapshot   ──▶  [snap][snap]...                                  │
-│    router_updates    ──▶  [update][update][update]...                      │
-│    bucket_meta       ──▶  [active:0][active:1][retired:5]...               │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Entry Format (per vector):                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │ PREFIX_META (256B)  │  len (8B)  │  id (8B)  │  dim (8B)  │  f32[]   │  │
-│  │                     │            │           │            │          │  │
-│  │  • meta length      │  payload   │  vector   │  vector    │  vector  │  │
-│  │  • owned_by topic   │  size      │  id       │  dimension │  data    │  │
-│  │  • next_block_start │            │           │            │          │  │
-│  │  • FNV-1a checksum  │            │           │            │          │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Physical Layout:                                                           │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                         File (1 GB)                                  │   │
-│  │  ┌─────────┬─────────┬─────────┬─────────┬─────────────────────────┐│   │
-│  │  │ Block 0 │ Block 1 │ Block 2 │   ...   │      Block 99           ││   │
-│  │  │  10 MB  │  10 MB  │  10 MB  │         │       10 MB             ││   │
-│  │  └─────────┴─────────┴─────────┴─────────┴─────────────────────────┘│   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  Constants (src/storage/wal/config.rs):                                     │
-│    • DEFAULT_BLOCK_SIZE:  10 MB                                            │
-│    • BLOCKS_PER_FILE:     100                                              │
-│    • PREFIX_META_SIZE:    256 bytes                                        │
-│    • MAX_BATCH_ENTRIES:   2,000,000                                        │
-│    • MAX_BATCH_BYTES:     10 GB                                            │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  I/O Backends:                                                              │
-│    • FD Backend (default): pread/pwrite, io_uring for batches             │
-│    • Mmap Backend:         memory-mapped files (fallback)                  │
-│                                                                             │
-│  Fsync Schedule:                                                            │
-│    • Milliseconds(200)  ─── default, fsync every 200ms                     │
-│    • SyncEach           ─── O_SYNC on every write                          │
-│    • NoFsync            ─── maximum throughput, no durability              │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-    Code: src/storage/wal/
-```
-
-### RocksDB Indexes
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                             RocksDB Indexes                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────────────────────────┐   ┌─────────────────────────────────┐ │
-│  │         VectorIndex             │   │         BucketIndex             │ │
-│  │                                 │   │                                 │ │
-│  │  Key:   vector_id (u64, LE)     │   │  Key:   vector_id (u64, LE)     │ │
-│  │  Value: rkyv-serialized Vector  │   │  Value: bucket_id (u64, LE)     │ │
-│  │                                 │   │                                 │ │
-│  │  Purpose:                       │   │  Purpose:                       │ │
-│  │  • Fetch vector by ID           │   │  • Find which bucket contains   │ │
-│  │  • Duplicate detection on       │   │    a given vector               │ │
-│  │    ingest (first_existing)      │   │  • Used for delete operations   │ │
-│  │                                 │   │                                 │ │
-│  │  Memory: ~96 MB                 │   │  Memory: ~96 MB                 │ │
-│  │    (64MB block cache +          │   │    (64MB block cache +          │ │
-│  │     2×16MB write buffers)       │   │     2×16MB write buffers)       │ │
-│  └─────────────────────────────────┘   └─────────────────────────────────┘ │
-│                                                                             │
-│  Code: src/vector_index.rs, src/bucket_index.rs                            │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+  No messages sent. Workers lazily discover changes on next operation.
 ```
 
 ---
 
 ## Data Flow
 
-### Insert Path
+### Query
 
 ```
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │                              INSERT FLOW                                 │
-   └─────────────────────────────────────────────────────────────────────────┘
-
-   Client
-      │
-      │  api.upsert(id=42, vector=[0.1, 0.2, ...])
-      │
-      ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │  1. ROUTE TO BUCKET                                                      │
-   │                                                                          │
-   │     RouterManager.RouteOrInit(vector)                                    │
-   │       │                                                                  │
-   │       ├── If no buckets exist: create bucket_0 with this vector as      │
-   │       │   centroid                                                       │
-   │       │                                                                  │
-   │       └── Else: HNSW.query(vector, top_k=1) → nearest bucket_id         │
-   │                                                                          │
-   └──────────────────────────────────┬──────────────────────────────────────┘
-                                      │
-                                      ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │  2. DISPATCH TO WORKER                                                   │
-   │                                                                          │
-   │     shard = hash_ring.node_for(bucket_id)                               │
-   │     worker_senders[shard].send(Upsert { bucket_id, vector })            │
-   │                                                                          │
-   └──────────────────────────────────┬──────────────────────────────────────┘
-                                      │
-                                      ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │  3. WORKER PERSISTS                                                      │
-   │                                                                          │
-   │     bucket_lock = bucket_locks.lock_for(bucket_id)                      │
-   │     _guard = bucket_lock.lock()                                          │
-   │                                                                          │
-   │     Storage.put_chunk(bucket_id, vector)     ────▶  Walrus topic        │
-   │     VectorIndex.put(id, vector)              ────▶  RocksDB             │
-   │     BucketIndex.put(id, bucket_id)           ────▶  RocksDB             │
-   │                                                                          │
-   └──────────────────────────────────┬──────────────────────────────────────┘
-                                      │
-                                      ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │  4. UPDATE ROUTER STATE                                                  │
-   │                                                                          │
-   │     RouterManager.ApplyUpsert(bucket_id, vector)                        │
-   │       │                                                                  │
-   │       ├── Update running centroid mean                                  │
-   │       ├── pending_updates++                                              │
-   │       ├── persist_update() → Walrus "router_updates" topic              │
-   │       │                                                                  │
-   │       └── If pending_updates >= 1000:                                   │
-   │             rebuild_router_and_persist()                                 │
-   │             persist_snapshot() → Walrus "router_snapshot" topic         │
-   │                                                                          │
-   └─────────────────────────────────────────────────────────────────────────┘
-
-   Code: src/service.rs:77-110, src/worker.rs:116-141, src/router_manager.rs:186-200
+1. SatoriHandle.query(vector, top_k)
+2. → RouterManager.Query → HNSW search → bucket_ids
+3. → HashRing.node_for(bucket_id) → worker shard assignment
+4. → Workers receive QueryRequest with their bucket subset
+5. → Each worker:
+      a. Check LRU cache for bucket
+      b. Cache miss → Storage.get_chunks() from WAL
+      c. L2 distance scan (SIMD accelerated)
+      d. Return local top-k
+6. → Coordinator merges results, sorts, returns global top-k
 ```
 
-### Query Path
+```
+                              Query Vector
+                                   │
+                                   ▼
+                        ┌─────────────────────┐
+                        │    RouterManager    │
+                        │  ┌───────────────┐  │
+                        │  │  HNSW Index   │  │
+                        │  │  (quantized)  │  │
+                        │  └───────┬───────┘  │
+                        └──────────┼──────────┘
+                                   │
+                          bucket_ids: [42, 17, 99, 203, ...]
+                                   │
+                    ┌──────────────┼──────────────┐
+                    │              │              │
+                    ▼              ▼              ▼
+            ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+            │  Worker 0   │ │  Worker 1   │ │  Worker 2   │
+            │ buckets:    │ │ buckets:    │ │ buckets:    │
+            │ [42, 203]   │ │ [17]        │ │ [99]        │
+            ├─────────────┤ ├─────────────┤ ├─────────────┤
+            │ cache hit?  │ │ cache hit?  │ │ cache hit?  │
+            │     │       │ │     │       │ │     │       │
+            │     ▼       │ │     ▼       │ │     ▼       │
+            │  L2 scan    │ │  L2 scan    │ │  L2 scan    │
+            │  (SIMD)     │ │  (SIMD)     │ │  (SIMD)     │
+            └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
+                   │               │               │
+                   └───────────────┼───────────────┘
+                                   │
+                                   ▼
+                        ┌─────────────────────┐
+                        │   Merge & Sort      │
+                        │   Return top-k      │
+                        └─────────────────────┘
+```
+
+### Insert
 
 ```
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │                               QUERY FLOW                                 │
-   └─────────────────────────────────────────────────────────────────────────┘
+1. SatoriHandle.upsert(id, vector)
+2. → RouterManager.RouteOrInit → get target bucket_id
+3. → HashRing.node_for(bucket_id) → worker shard
+4. → Worker:
+      a. BucketLocks.lock_for(bucket_id).await
+      b. VectorIndex.exists(id)? → reject duplicate
+      c. Storage.put_chunk() → append to WAL
+      d. VectorIndex.put_batch() → RocksDB
+      e. BucketIndex.put_batch() → RocksDB
+5. → RouterManager.ApplyUpsert → update running centroid
+```
 
-   Client
-      │
-      │  api.query(vector=[0.1, 0.2, ...], top_k=10, router_top_k=200)
-      │
-      ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │  1. ROUTER QUERY                                                         │
-   │                                                                          │
-   │     RouterManager.Query(vector, top_k=200)                              │
-   │                                                                          │
-   │     HNSW search:                                                         │
-   │       • Quantize query vector (f32 → u8)                                │
-   │       • Greedy descent through layers                                   │
-   │       • Beam search at layer 0 with ef_search=1200-4000                 │
-   │       • Return top-200 bucket IDs                                        │
-   │                                                                          │
-   │     → [bucket_12, bucket_47, bucket_89, bucket_103, ...]                │
-   │                                                                          │
-   └──────────────────────────────────┬──────────────────────────────────────┘
-                                      │
-                                      ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │  2. GROUP BY WORKER                                                      │
-   │                                                                          │
-   │     For each bucket_id:                                                  │
-   │       shard = hash_ring.node_for(bucket_id)                             │
-   │       requests[shard].push(bucket_id)                                   │
-   │                                                                          │
-   │     Worker 0: [12, 89, 201]                                             │
-   │     Worker 1: [47, 156]                                                 │
-   │     Worker 2: [103]                                                     │
-   │                                                                          │
-   └──────────────────────────────────┬──────────────────────────────────────┘
-                                      │
-                                      ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │  3. PARALLEL WORKER QUERIES                                              │
-   │                                                                          │
-   │     Send QueryRequest to each shard (parallel via join_all)             │
-   │                                                                          │
-   │     Each worker:                                                         │
-   │     ┌───────────────────────────────────────────────────────────────┐   │
-   │     │  for bucket_id in bucket_ids:                                  │   │
-   │     │      if cache.get(bucket_id):                                  │   │
-   │     │          scan_bucket_slice(cached_data, query_vec)             │   │
-   │     │      else:                                                     │   │
-   │     │          chunks = Storage.get_chunks(bucket_id)  ◄── Walrus   │   │
-   │     │          cache.put_from_chunks(bucket_id, chunks)              │   │
-   │     │          scan_bucket_chunks(chunks, query_vec)                 │   │
-   │     │                                                                │   │
-   │     │      // L2 distance computation (SIMD accelerated)            │   │
-   │     │      for each vector in bucket:                                │   │
-   │     │          dist = sqrt(sum((v[i] - q[i])^2))                    │   │
-   │     │          candidates.push((id, dist))                           │   │
-   │     │                                                                │   │
-   │     │  candidates.sort_by_distance()                                 │   │
-   │     │  return candidates.truncate(100)                               │   │
-   │     └───────────────────────────────────────────────────────────────┘   │
-   │                                                                          │
-   └──────────────────────────────────┬──────────────────────────────────────┘
-                                      │
-                                      ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │  4. MERGE RESULTS                                                        │
-   │                                                                          │
-   │     all_results = flatten(worker_responses)                             │
-   │     all_results.sort_by(|a, b| a.distance.cmp(&b.distance))             │
-   │     return all_results.truncate(top_k)                                  │
-   │                                                                          │
-   │     → [(id: 1001, dist: 0.023), (id: 4521, dist: 0.031), ...]           │
-   │                                                                          │
-   └─────────────────────────────────────────────────────────────────────────┘
+```
+                         Insert(id=7, vector=[...])
+                                   │
+                                   ▼
+                        ┌─────────────────────┐
+                        │   RouterManager     │
+                        │   RouteOrInit       │──────┐
+                        └──────────┬──────────┘      │
+                                   │                 │ (if no buckets exist,
+                          bucket_id = 42             │  create bucket 0)
+                                   │                 │
+                                   ▼                 │
+                        ┌─────────────────────┐      │
+                        │   ConsistentHash    │      │
+                        │   node_for(42) = 1  │      │
+                        └──────────┬──────────┘      │
+                                   │                 │
+                                   ▼                 │
+                        ┌─────────────────────┐      │
+                        │     Worker 1        │      │
+                        ├─────────────────────┤      │
+                        │ lock bucket 42      │      │
+                        │         │           │      │
+                        │         ▼           │      │
+                        │ ┌─────────────────┐ │      │
+                        │ │ VectorIndex     │ │      │
+                        │ │ exists(7)?  NO  │ │      │
+                        │ └────────┬────────┘ │      │
+                        │          │          │      │
+                        │          ▼          │      │
+                        │ ┌─────────────────┐ │      │
+                        │ │ WAL.append()    │ │      │
+                        │ └────────┬────────┘ │      │
+                        │          │          │      │
+                        │          ▼          │      │
+                        │ ┌─────────────────┐ │      │
+                        │ │ VectorIndex.put │ │      │
+                        │ │ BucketIndex.put │ │      │
+                        │ └─────────────────┘ │      │
+                        └──────────┬──────────┘      │
+                                   │                 │
+                                   ▼                 │
+                        ┌─────────────────────┐      │
+                        │   RouterManager     │◄─────┘
+                        │   ApplyUpsert       │
+                        │   (update centroid) │
+                        └─────────────────────┘
+```
 
-   Code: src/service.rs:44-56, 244-300
+### Split (Rebalancing)
+
+The split operation uses a **cut-over-then-drain** pattern:
+
+```
+1. RebalanceWorker detects oversized bucket (> threshold)
+2. Sample vectors, k-means cluster → 2 centroids
+3. Allocate new bucket IDs (A, B)
+4. Update centroids map:
+      - INSERT A, B
+      - REMOVE old bucket
+5. Rebuild router → new traffic goes to A, B immediately
+6. Drain loop:
+      while old_bucket not empty:
+          a. Peek batch from old bucket's WAL
+          b. Assign each vector to A or B (by distance)
+          c. Write to A and B
+          d. Update BucketIndex
+          e. Checkpoint (consume) the batch from old bucket
+7. Old bucket is now empty, effectively deleted
+```
+
+```
+ BEFORE SPLIT                          AFTER ROUTER UPDATE
+ ────────────                          ───────────────────
+
+    Router                                  Router
+  ┌────────┐                              ┌────────┐
+  │ HNSW:  │                              │ HNSW:  │
+  │ [0,1,2]│                              │ [0,1,A,B]  ◄── bucket 2 replaced
+  └────┬───┘                              └────┬───┘
+       │                                       │
+       ▼                                       ▼
+  ┌─────────┐                             ┌─────────┐
+  │Bucket 0 │                             │Bucket 0 │
+  │ (1000)  │                             │ (1000)  │
+  ├─────────┤                             ├─────────┤
+  │Bucket 1 │                             │Bucket 1 │
+  │ (1500)  │                             │ (1500)  │
+  ├─────────┤                             ├─────────┤
+  │Bucket 2 │ ◄── oversized!              │Bucket A │ ◄── new, empty
+  │ (5000)  │                             │ (0)     │
+  └─────────┘                             ├─────────┤
+                                          │Bucket B │ ◄── new, empty
+                                          │ (0)     │
+                                          └─────────┘
+
+                                          │Bucket 2 │ ◄── zombie, draining
+                                          │ (5000)  │     (invisible to router)
+                                          └─────────┘
+
+
+ DRAIN LOOP (runs until bucket 2 is empty)
+ ──────────────────────────────────────────
+
+  Iteration 1:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │   Bucket 2 (WAL)          Bucket A           Bucket B           │
+  │  ┌─────────────┐         ┌────────┐         ┌────────┐          │
+  │  │ v1 v2 v3... │─peek───►│        │         │        │          │
+  │  │             │         │        │         │        │          │
+  │  │             │  assign │ v1, v3 │         │ v2     │          │
+  │  │             │  by L2  │        │         │        │          │
+  │  └─────────────┘         └────────┘         └────────┘          │
+  │        │                                                        │
+  │        ▼                                                        │
+  │   checkpoint                                                    │
+  │   (consume batch)                                               │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  Iteration 2:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │   Bucket 2 (WAL)          Bucket A           Bucket B           │
+  │  ┌─────────────┐         ┌────────┐         ┌────────┐          │
+  │  │ v4 v5 v6... │─peek───►│ v1, v3 │         │ v2     │          │
+  │  │             │         │ v4, v6 │         │ v5     │          │
+  │  │             │         │        │         │        │          │
+  │  └─────────────┘         └────────┘         └────────┘          │
+  │        │                                                        │
+  │        ▼                                                        │
+  │   checkpoint                                                    │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ...repeat until bucket 2 is empty...
+
+  Final state:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │   Bucket 2 (WAL)          Bucket A           Bucket B           │
+  │  ┌─────────────┐         ┌────────┐         ┌────────┐          │
+  │  │   (empty)   │         │ ~2500  │         │ ~2500  │          │
+  │  │             │         │ vectors│         │ vectors│          │
+  │  └─────────────┘         └────────┘         └────────┘          │
+  │        │                                                        │
+  │        ▼                                                        │
+  │   bucket 2 gone                                                 │
+  │   (no tombstone needed)                                         │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+This is "graceful shutdown" for a data structure:
+- Remove from load balancer (router)
+- Drain in-flight work (remaining vectors)
+- Terminate when idle (empty bucket)
+
+---
+
+## CPU Pinning & Thread Model
+
+Workers are pinned to specific CPU cores using glommio's `LocalExecutor`:
+
+```rust
+// embedded.rs
+let pin_cpu = i % num_cpus::get().max(1);
+let builder = LocalExecutorBuilder::new(Placement::Fixed(pin_cpu))
+    .name(&format!("worker-{}", i));
+```
+
+```
+ CPU 0          CPU 1          CPU 2          CPU 3
+┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│ Worker 0 │   │ Worker 1 │   │ Worker 2 │   │ Worker 3 │
+│          │   │          │   │          │   │          │
+│ glommio  │   │ glommio  │   │ glommio  │   │ glommio  │
+│ executor │   │ executor │   │ executor │   │ executor │
+│          │   │          │   │          │   │          │
+│ L1/L2    │   │ L1/L2    │   │ L1/L2    │   │ L1/L2    │
+│ cache    │   │ cache    │   │ cache    │   │ cache    │
+│ affinity │   │ affinity │   │ affinity │   │ affinity │
+└──────────┘   └──────────┘   └──────────┘   └──────────┘
+     │              │              │              │
+     └──────────────┴──────────────┴──────────────┘
+                           │
+                    io_uring (shared)
+```
+
+### Why Pin?
+
+1. **Cache locality**: Worker's LRU cache stays hot in L1/L2
+2. **No migration overhead**: OS won't move thread between cores
+3. **Predictable latency**: No cache invalidation from core switches
+4. **NUMA awareness**: On multi-socket systems, memory stays local
+
+### Thread Inventory
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Thread Layout                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   Main Thread                                                           │
+│   └── SatoriDb (lifecycle, blocking API wrappers)                       │
+│                                                                         │
+│   Worker Threads (N, pinned to CPU 0..N-1)                              │
+│   ├── Worker 0  ─── glommio LocalExecutor ─── channel receiver          │
+│   ├── Worker 1  ─── glommio LocalExecutor ─── channel receiver          │
+│   ├── Worker 2  ─── glommio LocalExecutor ─── channel receiver          │
+│   └── ...                                                               │
+│                                                                         │
+│   Router Thread (unpinned)                                              │
+│   └── RouterManager ─── crossbeam receiver ─── HNSW owner               │
+│                                                                         │
+│   Rebalancer Thread (unpinned, or pinned if configured)                 │
+│   └── RebalanceWorker ─── glommio LocalExecutor ─── split/delete        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### glommio + io_uring
+
+Workers use glommio, which is built on io_uring:
+
+- **Async I/O without thread pool**: io_uring does kernel-side async
+- **Single-threaded executors**: No work-stealing, no cross-core synchronization
+- **Cooperative scheduling**: Tasks yield explicitly, no preemption
+- **Linux only**: io_uring requires kernel 5.8+
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        glommio LocalExecutor                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   Task Queue                    io_uring                                │
+│  ┌──────────────┐            ┌──────────────┐                           │
+│  │ task1        │            │ SQ (submit)  │──────► kernel             │
+│  │ task2        │            ├──────────────┤                           │
+│  │ task3        │            │ CQ (complete)│◄────── kernel             │
+│  │ ...         │            └──────────────┘                           │
+│  └──────────────┘                   │                                   │
+│        │                            │                                   │
+│        ▼                            ▼                                   │
+│   ┌─────────────────────────────────────────┐                           │
+│   │           Event Loop                    │                           │
+│   │   1. Poll CQ for completions            │                           │
+│   │   2. Wake tasks waiting on I/O          │                           │
+│   │   3. Run ready tasks                    │                           │
+│   │   4. Submit new I/O to SQ               │                           │
+│   └─────────────────────────────────────────┘                           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Rebalancer
+## Shared-Nothing Design
 
-Autonomous background worker that splits oversized buckets:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              REBALANCER LOOP                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│     Every 500ms:                                                            │
-│                                                                             │
-│     1. refresh_sizes()                                                      │
-│        └── For each bucket: count = wal.get_topic_entry_count(topic)       │
-│                                                                             │
-│     2. Find largest bucket                                                  │
-│        └── max_bucket = argmax(bucket_sizes)                               │
-│                                                                             │
-│     3. If max_size > threshold (default: 2000):                            │
-│                                                                             │
-│        ┌─────────────────────────────────────────────────────────────┐     │
-│        │                    SPLIT PROCESS                             │     │
-│        ├─────────────────────────────────────────────────────────────┤     │
-│        │                                                              │     │
-│        │  a) Acquire bucket lock (serialize with workers)            │     │
-│        │                                                              │     │
-│        │  b) Load vectors from Walrus                                 │     │
-│        │     chunks = Storage.get_chunks(bucket_id)                  │     │
-│        │     vectors = decode_all_chunks(chunks)                     │     │
-│        │                                                              │     │
-│        │  c) K-means split (k=2)                                      │     │
-│        │     ┌──────────────────────────────────────────────────┐    │     │
-│        │     │  Init: farthest-pair centroids                   │    │     │
-│        │     │  Iterate: max 8 iterations                       │    │     │
-│        │     │    • Assign vectors to nearest centroid          │    │     │
-│        │     │    • Recompute centroids                          │    │     │
-│        │     │  Output: 2 new buckets with vectors               │    │     │
-│        │     └──────────────────────────────────────────────────┘    │     │
-│        │                                                              │     │
-│        │  d) Persist new buckets                                      │     │
-│        │     new_id_1 = allocate_bucket_id()                         │     │
-│        │     new_id_2 = allocate_bucket_id()                         │     │
-│        │     Storage.put_chunk(new_id_1, vectors_1)                  │     │
-│        │     Storage.put_chunk(new_id_2, vectors_2)                  │     │
-│        │                                                              │     │
-│        │  e) Update BucketIndex for all moved vectors                │     │
-│        │     bucket_index.put_batch(new_id_1, vector_ids_1)          │     │
-│        │     bucket_index.put_batch(new_id_2, vector_ids_2)          │     │
-│        │                                                              │     │
-│        │  f) Retire old bucket                                        │     │
-│        │     centroids.remove(old_bucket_id)                         │     │
-│        │     Storage.put_bucket_meta(Retired)                        │     │
-│        │                                                              │     │
-│        │  g) Rebuild router with new centroids                       │     │
-│        │     rebuild_router([old_id, new_id_1, new_id_2])            │     │
-│        │                                                              │     │
-│        │  h) Checkpoint old bucket (mark blocks as reclaimable)      │     │
-│        │                                                              │     │
-│        └─────────────────────────────────────────────────────────────┘     │
-│                                                                             │
-│     Else: sleep 500ms                                                       │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-   Threshold: SATORI_REBALANCE_THRESHOLD env var (default: 2000)
-
-   Code: src/rebalancer.rs:497-545 (loop), 259-359 (split)
-```
-
----
-
-## Algorithms
-
-### HNSW Router Index
+Each worker is isolated:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                               HNSW Structure                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Layer 3:          ●───────────────────────────────●                       │
-│                     │                               │                        │
-│   Layer 2:          ●───────────●───────────────────●                       │
-│                     │           │                   │                        │
-│   Layer 1:          ●───●───────●───────●───────────●───●                   │
-│                     │   │       │       │           │   │                    │
-│   Layer 0:    ●─────●───●───●───●───●───●───●───●───●───●───●───●           │
-│               ↑                                                             │
-│             entry                                                           │
-│             point                                                           │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Parameters (src/router.rs:30):                                            │
-│     M = 24                  (max neighbors per node, layers > 0)           │
-│     M0 = 48                 (max neighbors at layer 0)                      │
-│     ef_construction = 180   (beam width during insertion)                   │
-│                                                                             │
-│   Query Parameters (src/router.rs:102-124):                                 │
-│     ef_search scales with index size and top_k:                            │
-│       • top_k=1:   64-128 (fast path for insert routing)                   │
-│       • top_k>1:   1200-4000 (quality-focused for queries)                 │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Quantization (src/quantizer.rs):                                          │
-│                                                                             │
-│     f32 → u8 scalar quantization:                                          │
-│       quantized = clamp((value - min) * 255 / (max - min), 0, 255)         │
-│                                                                             │
-│     Bounds computed with 0.1% padding to handle edge values                 │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Distance (src/router_hnsw.rs):                                            │
-│                                                                             │
-│     Cosine similarity over centered i8 vectors:                            │
-│       centered[i] = u8[i] ^ 0x80   (convert u8 to signed)                  │
-│       dist = 1 - dot(a, b) / (norm(a) * norm(b))                           │
-│                                                                             │
-│     SIMD: AVX2, AVX-512 kernels (src/router_hnsw.rs:722-871)               │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                         Worker N                                │
+├─────────────────────────────────────────────────────────────────┤
+│  LocalExecutor (glommio, pinned to CPU N)                       │
+│  ├── channel receiver (owned)                                   │
+│  ├── Executor (owned)                                           │
+│  │   └── WorkerCache (owned, LRU, no cross-worker sharing)      │
+│  └── Storage handle (Arc to WAL, append-only so no conflicts)   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### K-Means Clustering (Indexer)
+Workers share *references* to:
+- `Arc<Walrus>` — append-only, no coordination needed
+- `Arc<VectorIndex>` — RocksDB handles concurrency
+- `Arc<BucketIndex>` — same
+- `Arc<BucketLocks>` — per-bucket granularity, rarely collide
+
+They share *no mutable state*. This is the actor model without the framework.
+
+### Worker Cache (LRU)
+
+Each worker has a fixed-size arena-allocated LRU cache:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            K-MEANS CLUSTERING                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Used for:                                                                  │
-│     • Initial cluster formation: build_clusters(vectors, k)                │
-│     • Bucket splitting: split_bucket_once(bucket) → 2 buckets              │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Initialization (for k=2 splits):                                          │
-│                                                                             │
-│     Farthest-pair method:                                                   │
-│       1. c1 = vectors[0]                                                   │
-│       2. c2 = argmax_v( distance(v, c1) )                                  │
-│       3. c1 = argmax_v( distance(v, c2) )     (refine)                     │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Iteration (max 8 for splits, max 20 for initial build):                  │
-│                                                                             │
-│     for iter in 0..max_iters:                                               │
-│       1. Assign each vector to nearest centroid                            │
-│       2. Recompute centroids as mean of assigned vectors                   │
-│       3. If no assignments changed → converged, break                      │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   SIMD Acceleration (src/indexer.rs:392-586):                              │
-│                                                                             │
-│     • k=2 special kernel: compute both distances in single pass            │
-│     • k>=8 block kernel: process 8 centroids at once (SoA layout)          │
-│     • AVX2 + FMA for L2 distance computation                               │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Fallback (src/indexer.rs:217-243):                                        │
-│                                                                             │
-│     If k=2 and one cluster ends up empty → split vectors in half           │
-│     (guarantees split always produces 2 non-empty buckets)                 │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         WorkerCache                                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   HashMap<bucket_id, slot_index>     Doubly-linked list (LRU order)     │
+│  ┌─────────────────────────┐        ┌─────────────────────────────┐     │
+│  │ 42 → slot 0             │        │ head                        │     │
+│  │ 17 → slot 1             │        │   ↓                         │     │
+│  │ 99 → slot 2             │        │ [slot 2] ←→ [slot 0] ←→ [slot 1]  │
+│  └─────────────────────────┘        │                         ↑   │     │
+│                                     │                       tail  │     │
+│                                     └─────────────────────────────┘     │
+│                                                                         │
+│   Arena (pre-allocated, fixed size)                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ slot 0          │ slot 1          │ slot 2          │ ...       │    │
+│  │ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │           │    │
+│  │ │ bucket 42   │ │ │ bucket 17   │ │ │ bucket 99   │ │           │    │
+│  │ │ data...     │ │ │ data...     │ │ │ data...     │ │           │    │
+│  │ │ (128MB max) │ │ │             │ │ │             │ │           │    │
+│  │ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │           │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│   On access: move to head                                               │
+│   On eviction: remove tail, reuse slot                                  │
+│   On version change: invalidate changed buckets                         │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Consistent Hash Ring
+
+Buckets are assigned to workers via consistent hashing:
+
+```
+                        Hash Ring (virtual nodes)
+
+                               0°
+                               │
+                       ┌───────┴───────┐
+                      ╱                 ╲
+                    W0                   W1
+                   ╱                       ╲
+                 90°                        270°
+                  │                          │
+                  W2                        W3
+                   ╲                       ╱
+                    W0                   W1
+                      ╲                 ╱
+                       └───────┬───────┘
+                               │
+                              180°
+
+
+   bucket_id = 42
+       │
+       ▼
+   hash(42) = 0x7A3F...  ──────►  lands between W1 and W2
+       │                                    │
+       ▼                                    ▼
+   node_for(42) = Worker 2         (clockwise to next node)
+
+
+   Distribution with 4 workers, 8 virtual nodes each:
+
+   Worker 0: handles buckets hashing to ~25% of ring
+   Worker 1: handles buckets hashing to ~25% of ring
+   Worker 2: handles buckets hashing to ~25% of ring
+   Worker 3: handles buckets hashing to ~25% of ring
 ```
 
 ---
 
-## Recovery
+## Lock Inventory
+
+The system has very few locks:
+
+| Lock | Location | Contention |
+|------|----------|------------|
+| `RwLock<Router>` | RoutingTable | Workers snapshot() and leave immediately |
+| `Mutex<WorkerCache>` | Executor | Per-worker, zero cross-thread contention |
+| `RwLock<HashMap>` | RebalanceState | Only touched by rebalancer thread |
+| `DashMap<Mutex>` | BucketLocks | Per-bucket, different buckets = different locks |
+
+The hot path has zero lock contention:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              STARTUP RECOVERY                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   1. Router Manager Recovery (src/router_manager.rs:364-391):              │
-│                                                                             │
-│      ┌────────────────────────────────────────────────────────────────┐    │
-│      │  a) Load latest router_snapshot from Walrus                    │    │
-│      │     → Recovers: bucket metadata (id, centroid, count)         │    │
-│      │     → Also stores: updates_offset (how far updates were read) │    │
-│      │                                                                │    │
-│      │  b) Replay router_updates from updates_offset                  │    │
-│      │     → Applies incremental centroid changes since snapshot     │    │
-│      │                                                                │    │
-│      │  c) Rebuild HNSW router from recovered centroids               │    │
-│      └────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-│   2. Workers: Start with empty caches                                       │
-│      → Bucket data loaded on-demand from Walrus topics                     │
-│                                                                             │
-│   3. RocksDB indexes: Just reopen (already durable)                        │
-│      → VectorIndex, BucketIndex                                            │
-│                                                                             │
-│   4. Rebalancer: Refresh sizes from Walrus topic entry counts              │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+Query:
+  RoutingTable.snapshot()     → clone Arc, release immediately
+  HashRing.node_for()         → pure function
+  Worker.cache.get()          → local mutex, no contention
+  Storage.get_chunks()        → WAL read
+  L2 scan                     → pure compute
 ```
 
 ---
 
-## Thread Model
+## Durability Model
+
+- All writes go through Walrus (WAL) before indexes
+- fsync is scheduled on a timer (default 200ms)
+- Insert returns after WAL append, before fsync
+- Crash between append and fsync = data loss window
+- Each bucket is a separate WAL topic (no global log contention)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              THREAD ARCHITECTURE                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   ┌─────────────────────────────────────────────────────────────────────┐  │
-│   │  Main Thread                                                         │  │
-│   │    • Creates SatoriDb                                                │  │
-│   │    • Holds SatoriHandle for API calls                               │  │
-│   └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
-│   ┌─────────────────────────────────────────────────────────────────────┐  │
-│   │  Router Manager Thread ("router-mgr")                               │  │
-│   │    • Single thread, blocking channel receive                        │  │
-│   │    • Handles: Query, RouteOrInit, ApplyUpsert, Flush, Stats        │  │
-│   │    • Channel: crossbeam unbounded                                   │  │
-│   └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
-│   ┌─────────────────────────────────────────────────────────────────────┐  │
-│   │  Worker Threads ("worker-0", "worker-1", ..., "worker-N")          │  │
-│   │    • N = num_cpus (configurable via SatoriDbConfig.workers)        │  │
-│   │    • Each runs Glommio LocalExecutor, CPU-pinned                   │  │
-│   │    • Channel: async_channel bounded(1000)                          │  │
-│   │    • Concurrency limit: 32 parallel query tasks per worker         │  │
-│   └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
-│   ┌─────────────────────────────────────────────────────────────────────┐  │
-│   │  Rebalancer Thread ("rebalance-loop")                               │  │
-│   │    • Glommio LocalExecutor (optional CPU pin)                      │  │
-│   │    • Autonomous monitoring loop                                     │  │
-│   │    • Delete command channel: async_channel bounded(1024)           │  │
-│   └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
-│   Synchronization:                                                          │
-│     • BucketLocks: per-bucket async Mutex (workers ↔ rebalancer)          │
-│     • RoutingTable: Arc<RwLock> for sharing router snapshots              │
-│     • Channels: message passing for all commands                          │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+                              WAL Structure (Walrus)
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                                                                         │
+  │   Topic: "bucket_0"              Topic: "bucket_1"                      │
+  │  ┌─────────────────────┐        ┌─────────────────────┐                 │
+  │  │ entry: [len][id][dim][data]  │ entry: [len][id][dim][data]           │
+  │  │ entry: [len][id][dim][data]  │ entry: [len][id][dim][data]           │
+  │  │ entry: [len][id][dim][data]  │ entry: ...                            │
+  │  │ ...                 │        │                     │                 │
+  │  │       ▲             │        │                     │                 │
+  │  │       │ checkpoint  │        │                     │                 │
+  │  │       │ cursor      │        │                     │                 │
+  │  └───────┴─────────────┘        └─────────────────────┘                 │
+  │                                                                         │
+  │   Topic: "bucket_42"             Topic: "router_snapshot"               │
+  │  ┌─────────────────────┐        ┌─────────────────────┐                 │
+  │  │ entry: ...          │        │ [min][max][buckets...]                │
+  │  │ entry: ...          │        │ (serialized via rkyv)                 │
+  │  │                     │        │                     │                 │
+  │  └─────────────────────┘        └─────────────────────┘                 │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Write path:
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │                                                                        │
+  │   Worker                                                               │
+  │      │                                                                 │
+  │      ▼                                                                 │
+  │   Storage.put_chunk(bucket_id, vectors)                                │
+  │      │                                                                 │
+  │      ▼                                                                 │
+  │   Walrus.append_for_topic("bucket_{id}", serialized_entry)             │
+  │      │                                                                 │
+  │      ├──► write to memory buffer ──► return immediately (fast path)    │
+  │      │                                                                 │
+  │      └──► background: fsync every 200ms (configurable)                 │
+  │                                                                        │
+  └────────────────────────────────────────────────────────────────────────┘
+
+  Crash recovery:
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │                                                                        │
+  │   On startup:                                                          │
+  │   1. Walrus scans all topic files                                      │
+  │   2. RouterManager loads "router_snapshot" → rebuild HNSW              │
+  │   3. RouterManager applies "router_updates" since snapshot             │
+  │   4. Workers ready (buckets loaded on-demand)                          │
+  │                                                                        │
+  │   Data not fsync'd before crash is lost.                               │
+  │   VectorIndex/BucketIndex (RocksDB) may be ahead of WAL.               │
+  │   WAL is source of truth for bucket contents.                          │
+  │                                                                        │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Configuration
+## Scaling Characteristics
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SATORI_REBALANCE_THRESHOLD` | 2000 | Split bucket when vector count exceeds |
-| `SATORI_ROUTER_REBUILD_EVERY` | 1000 | Rebuild HNSW after N updates |
-| `SATORI_WORKER_CACHE_BUCKETS` | 64 | Max buckets in worker LRU cache |
-| `SATORI_WORKER_CACHE_BUCKET_MB` | 64 | Max MB per cached bucket |
-| `SATORI_VECTOR_INDEX_PATH` | temp dir | Path for VectorIndex RocksDB |
-| `SATORI_BUCKET_INDEX_PATH` | temp dir | Path for BucketIndex RocksDB |
-| `WALRUS_DATA_DIR` | `./wal_files` | Walrus storage directory |
-| `WALRUS_QUIET` | unset | Suppress Walrus debug output |
+### What scales well:
+
+| Aspect | Why |
+|--------|-----|
+| Vector count | Buckets are independent, parallel scanning |
+| Query throughput | N workers, each with own cache |
+| Write throughput | Per-bucket locking, no global contention |
+| Memory | Quantized router (~1 byte/dim), bounded caches |
+
+### Known ceilings:
+
+| Aspect | Bottleneck |
+|--------|------------|
+| Query routing | RouterManager is single-threaded |
+| Router rebuild | O(buckets), causes latency spikes every ~1000 inserts |
+| Cold start | HNSW rebuilt from centroids on startup |
+| Deletes | O(bucket_size) per delete (rewrite entire bucket) |
+
+### Billion-scale math:
+
+```
+1B vectors ÷ 2000 per bucket = 500k buckets
+
+Router memory:
+  500k × 768 dims × 1 byte (quantized) ≈ 384MB
+  + HNSW graph overhead ≈ 1-2GB total
+
+Query (probing 500 buckets):
+  500 buckets × 2000 vectors = 1M L2 distance calculations
+  Distributed across N workers
+  SIMD accelerated
+```
+
+---
+
+## Design Decisions
+
+The architecture is opinionated:
+
+| Decision | Choice | Rejected alternative |
+|----------|--------|----------------------|
+| Threading | 1 thread per role, channels | Thread pool + shared state |
+| WAL | Walrus, io_uring, Linux only | Cross-platform, pluggable |
+| Indexes | RocksDB, hardcoded | Pluggable backend |
+| Quantization | 8-bit scalar, fixed at init | Adaptive precision |
+| Routing | HNSW always | Flat/IVF options |
+| Splits | 2-way only | k-way, configurable |
+| API | Embedded library | Server mode |
+
+Configuration surface is minimal:
+
+```rust
+SatoriDb::builder("name")
+    .workers(N)        // thread count
+    .fsync_ms(N)       // durability interval
+    .data_dir(path)    // storage location
+    .build()
+```
+
+Power-user tuning via environment variables:
+
+```
+SATORI_REBALANCE_THRESHOLD=2000    # vectors before split
+SATORI_WORKER_CACHE_BUCKETS=128    # LRU cache size
+SATORI_ROUTER_REBUILD_EVERY=1000   # inserts between rebuilds
+SATORI_REBALANCE_POLL_MS=300000    # rebalancer wake interval
+```
+
+---
+
+## Key Insights
+
+1. **Distributed patterns at small scale**: The architecture uses patterns from distributed systems (cut-over-then-drain, version-based invalidation, message passing) but applies them to threads in a single process. The patterns work because the *problem structure* is the same—concurrent actors with partial visibility.
+
+2. **Boring components, clever composition**: Each component is simple (loop over channel, match on message). The sophistication is in how they're wired together.
+
+3. **Optimistic concurrency everywhere**: Version numbers instead of locks. Stale reads are acceptable. Conflicts are rare.
+
+4. **WAL as source of truth**: A bucket *is* its WAL topic. Splitting is log compaction. Deletion is rewriting. No separate "bucket store" to coordinate with.
+
+5. **Escape complexity via ownership**: Instead of synchronizing access to shared state, each component owns its state exclusively. "Who writes X? One guy. Always."
