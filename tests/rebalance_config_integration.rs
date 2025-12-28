@@ -47,6 +47,7 @@ fn rebalance_respects_target_size_threshold() -> Result<()> {
         None,
         bucket_locks,
         threshold,
+        100,
     );
 
     // Build a bucket just over a custom target size.

@@ -48,6 +48,7 @@ fn rebalance_split_increases_buckets_and_router_version() -> Result<()> {
         None,
         bucket_locks,
         threshold,
+        100,
     );
 
     // Persist a bucket with enough vectors to split.

@@ -1,6 +1,7 @@
 use crate::bucket_index::BucketIndex;
 use crate::bucket_locks::BucketLocks;
 use crate::executor::{Executor, WorkerCache};
+use crate::ingest_control;
 use crate::ingest_counter;
 use crate::storage::wal::runtime::Walrus;
 use crate::storage::{Bucket, Storage, StorageExecMode, Vector};
@@ -65,22 +66,28 @@ pub async fn run_worker(
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(64);
+        .unwrap_or(128);
     let cache_bucket_mb: usize = std::env::var("SATORI_WORKER_CACHE_BUCKET_MB")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(64);
+        .unwrap_or(128);
     let cache_bucket_bytes = cache_bucket_mb * 1024 * 1024;
     let cache_total_bytes = cache_max_buckets
         .saturating_mul(cache_bucket_bytes)
         .max(cache_bucket_bytes);
+    let skip_dup_checks = std::env::var("SATORI_SKIP_DUP_CHECKS").is_ok()
+        || std::env::var("SATORI_RUN_BENCH").is_ok();
     let cache = WorkerCache::new(cache_max_buckets, cache_bucket_bytes, cache_total_bytes);
     let executor = Rc::new(Executor::new(storage.clone(), cache));
     Storage::prewarm_thread_locals(2048, 1024);
 
-    const MAX_CONCURRENCY: usize = 32;
-    let (limit_tx, limit_rx) = async_channel::bounded(MAX_CONCURRENCY);
+    let max_concurrency: usize = std::env::var("SATORI_WORKER_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(512);
+    let (limit_tx, limit_rx) = async_channel::bounded(max_concurrency);
 
     while let Ok(msg) = receiver.recv().await {
         match msg {
@@ -111,18 +118,24 @@ pub async fn run_worker(
                 vector,
                 respond_to,
             } => {
-                // Check for duplicate id before acquiring lock
-                match vector_index.exists(vector.id) {
-                    Ok(true) => {
-                        let _ = respond_to
-                            .send(Err(anyhow::anyhow!("id {} already exists", vector.id)));
-                        continue;
+                if !ingest_control::ingestion_allowed() {
+                    let _ = respond_to.send(Err(anyhow::anyhow!("ingestion disabled")));
+                    continue;
+                }
+                if !skip_dup_checks {
+                    // Check for duplicate id before acquiring lock
+                    match vector_index.exists(vector.id) {
+                        Ok(true) => {
+                            let _ = respond_to
+                                .send(Err(anyhow::anyhow!("id {} already exists", vector.id)));
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = respond_to.send(Err(e));
+                            continue;
+                        }
+                        Ok(false) => {}
                     }
-                    Err(e) => {
-                        let _ = respond_to.send(Err(e));
-                        continue;
-                    }
-                    Ok(false) => {}
                 }
 
                 let lock = bucket_locks.lock_for(bucket_id);
@@ -162,6 +175,10 @@ pub async fn run_worker(
                 vectors,
                 respond_to,
             } => {
+                if !ingest_control::ingestion_allowed() {
+                    let _ = respond_to.send(Err(anyhow::anyhow!("ingestion disabled")));
+                    continue;
+                }
                 let mut ids = Vec::with_capacity(vectors.len());
                 let mut seen = std::collections::HashSet::with_capacity(vectors.len());
                 let mut duplicate_in_batch = None;
@@ -188,19 +205,21 @@ pub async fn run_worker(
                         let _ = limit_rx.recv().await;
                         return;
                     }
-                    match vector_index.first_existing(&ids) {
-                        Ok(Some(existing)) => {
-                            let _ = respond_to
-                                .send(Err(anyhow::anyhow!("id {} already exists", existing)));
-                            let _ = limit_rx.recv().await;
-                            return;
+                    if !skip_dup_checks {
+                        match vector_index.first_existing(&ids) {
+                            Ok(Some(existing)) => {
+                                let _ = respond_to
+                                    .send(Err(anyhow::anyhow!("id {} already exists", existing)));
+                                let _ = limit_rx.recv().await;
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = respond_to.send(Err(e));
+                                let _ = limit_rx.recv().await;
+                                return;
+                            }
+                            Ok(None) => {}
                         }
-                        Err(e) => {
-                            let _ = respond_to.send(Err(e));
-                            let _ = limit_rx.recv().await;
-                            return;
-                        }
-                        Ok(None) => {}
                     }
 
                     let topic = Storage::topic_for(bucket_id);

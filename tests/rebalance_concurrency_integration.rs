@@ -47,6 +47,7 @@ fn routing_snapshots_survive_concurrent_split() -> Result<()> {
         None,
         bucket_locks,
         threshold,
+        100,
     );
 
     // Prime with one bucket.

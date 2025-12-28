@@ -1,5 +1,6 @@
 use crate::bucket_index::BucketIndex;
 use crate::bucket_locks::BucketLocks;
+use crate::ingest_control;
 use crate::rebalancer::RebalanceWorker;
 use crate::router::RoutingTable;
 use crate::router_manager::{spawn_router_manager, RouterCommand, RouterShutdownRequest};
@@ -19,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 // ============================================================================
 // Builder
@@ -254,6 +256,18 @@ impl SatoriDb {
     /// ```
     pub fn delete(&self, id: u64) -> Result<()> {
         block_on(self.handle.delete(id))
+    }
+
+    /// Run an aggressive rebalancing pass until no bucket exceeds the threshold.
+    ///
+    /// This call blocks and will use all CPU cores. It is best invoked when
+    /// ingestion is paused.
+    pub fn aggressive_rebalance(&self) -> Result<usize> {
+        ingest_control::disallow_ingestion();
+        thread::sleep(Duration::from_secs(10));
+        let result = self.rebalance_worker.aggressive_rebalance_blocking();
+        ingest_control::allow_ingestion();
+        result.map_err(|e| anyhow!(e))
     }
 
     /// Query for the nearest neighbors of a vector.

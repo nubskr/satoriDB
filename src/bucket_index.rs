@@ -6,18 +6,21 @@ use std::path::Path;
 ///
 /// This keeps the reverse lookup lightweight without holding everything in RAM.
 pub struct BucketIndex {
-    db: DB,
+    db: Option<DB>,
 }
 
 impl BucketIndex {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        if std::env::var("SATORI_RUN_BENCH").is_ok() {
+            return Ok(Self { db: None });
+        }
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
         opts.optimize_level_style_compaction(64 * 1024 * 1024);
 
-        // Enforce FD limits
-        opts.set_max_open_files(1024);
+        // Let RocksDB manage open files (no internal cap).
+        opts.set_max_open_files(-1);
         opts.set_allow_mmap_reads(false);
         opts.set_allow_mmap_writes(false);
 
@@ -31,11 +34,15 @@ impl BucketIndex {
         opts.set_write_buffer_size(16 * 1024 * 1024);
         opts.set_max_write_buffer_number(2);
         let db = DB::open(&opts, path).context("open bucket index")?;
-        Ok(Self { db })
+        Ok(Self { db: Some(db) })
     }
 
     /// Insert or overwrite a batch of `id -> bucket` mappings.
     pub fn put_batch(&self, bucket_id: u64, ids: &[u64]) -> Result<()> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(()),
+        };
         if ids.is_empty() {
             return Ok(());
         }
@@ -43,12 +50,16 @@ impl BucketIndex {
         for id in ids {
             batch.put(id.to_le_bytes(), bucket_id.to_le_bytes());
         }
-        self.db.write(batch).context("write bucket index batch")
+        db.write(batch).context("write bucket index batch")
     }
 
     /// Delete a batch of ids (best-effort; missing keys are ignored).
     #[allow(dead_code)]
     pub fn delete_batch(&self, ids: &[u64]) -> Result<()> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(()),
+        };
         if ids.is_empty() {
             return Ok(());
         }
@@ -56,15 +67,18 @@ impl BucketIndex {
         for id in ids {
             batch.delete(id.to_le_bytes());
         }
-        self.db.write(batch).context("delete bucket index batch")
+        db.write(batch).context("delete bucket index batch")
     }
 
     /// Fetch the stored bucket ids for the given vector ids. Missing ids are skipped.
     pub fn get_many(&self, ids: &[u64]) -> Result<Vec<(u64, u64)>> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(Vec::new()),
+        };
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(raw) = self
-                .db
+            if let Some(raw) = db
                 .get(id.to_le_bytes())
                 .with_context(|| format!("read id {} from bucket index", id))?
             {

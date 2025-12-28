@@ -15,6 +15,11 @@ pub struct RouterTask {
     pub respond_to: oneshot::Sender<anyhow::Result<RouterResult>>,
 }
 
+pub enum RouterMessage {
+    Query(RouterTask),
+    Refresh(oneshot::Sender<()>),
+}
+
 #[derive(Clone)]
 pub struct ConsistentHashRing {
     ring: Vec<(u64, usize)>,

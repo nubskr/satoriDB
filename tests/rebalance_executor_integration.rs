@@ -48,6 +48,7 @@ fn split_updates_routing_and_executor_results() -> Result<()> {
         None,
         bucket_locks,
         threshold,
+        100,
     );
 
     // One bucket containing two clear clusters: near (0,0) and near (100,100).

@@ -438,9 +438,15 @@ async fn run_benchmark_mode(
         }
     }
 
-    let (initial_batch_size, stream_batch_size, k, router_top_k) = match dataset.kind {
-        DatasetKind::Bigann => (100_000, 100_000, 100, 20),
-        DatasetKind::Gist => (50_000, 100_000, 100, 400),
+    let (default_initial_batch_size, stream_batch_size, k, router_top_k) = match dataset.kind {
+        DatasetKind::Bigann => (500_000, 500_000, 10, 20),
+        DatasetKind::Gist => (50_000, 100_000, 10, 400),
+    };
+
+    let initial_batch_size = if dataset.use_s3 {
+        200_000
+    } else {
+        default_initial_batch_size
     };
 
     if dataset.base_path.exists() || dataset.use_s3 {

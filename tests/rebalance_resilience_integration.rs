@@ -47,6 +47,7 @@ fn rebalance_fast_path_split_triggers_on_oversized_bucket() -> Result<()> {
         None,
         bucket_locks,
         threshold,
+        100,
     );
 
     // Create one large bucket and prime centroids.

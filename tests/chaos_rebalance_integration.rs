@@ -52,6 +52,7 @@ fn rebalance_survives_split_failures() -> Result<()> {
         None,
         bucket_locks,
         threshold,
+        100,
     );
 
     // Seed one bucket with enough vectors to split (32 > 10).

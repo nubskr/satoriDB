@@ -5,7 +5,29 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config::Credentials, config::Region, Client};
 use std::thread;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+const HEADER_BYTES: usize = 12;
+const MAX_READ_RETRIES: usize = 3;
+
+async fn open_body_at(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+) -> Result<Box<dyn AsyncRead + Unpin + Send>> {
+    let range = format!("bytes={}-", offset);
+    let object = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(range)
+        .send()
+        .await
+        .context("failed to get object range from s3")?;
+
+    Ok(Box::new(object.body.into_async_read()))
+}
 
 pub fn spawn_s3_reader(
     endpoint: String,
@@ -67,18 +89,18 @@ async fn run_s3_stream(
 
     let object = client
         .get_object()
-        .bucket(bucket)
-        .key(key)
+        .bucket(bucket.as_str())
+        .key(key.as_str())
         .send()
         .await
         .context("failed to get object from s3")?;
 
-    let mut body = object.body.into_async_read();
+    let mut body: Box<dyn AsyncRead + Unpin + Send> = Box::new(object.body.into_async_read());
 
     // Read Header
     // dim: u32 (4 bytes)
     // count: u64 (8 bytes)
-    let mut header = [0u8; 12];
+    let mut header = [0u8; HEADER_BYTES];
     body.read_exact(&mut header)
         .await
         .context("failed to read header")?;
@@ -97,21 +119,72 @@ async fn run_s3_stream(
         let this_batch = remaining.min(batch_size);
         let bytes_needed = this_batch * vector_size;
 
-        body.read_exact(&mut buffer[..bytes_needed])
-            .await
-            .context("failed to read batch")?;
+        let data_offset = HEADER_BYTES as u64 + (current_idx as u64 * vector_size as u64);
+        let mut bytes_read = 0usize;
+        let mut attempts = 0usize;
+        while bytes_read < bytes_needed {
+            match body.read(&mut buffer[bytes_read..bytes_needed]).await {
+                Ok(0) => {
+                    attempts += 1;
+                    if attempts > MAX_READ_RETRIES {
+                        return Err(anyhow::anyhow!(
+                            "S3 stream stalled after {} retries at offset {}",
+                            MAX_READ_RETRIES,
+                            data_offset + bytes_read as u64
+                        ));
+                    }
+                    log::warn!(
+                        "S3 stream stalled at offset {}, retrying ({}/{})",
+                        data_offset + bytes_read as u64,
+                        attempts,
+                        MAX_READ_RETRIES
+                    );
+                    body = open_body_at(
+                        &client,
+                        &bucket,
+                        &key,
+                        data_offset + bytes_read as u64,
+                    )
+                    .await?;
+                }
+                Ok(n) => {
+                    bytes_read += n;
+                    attempts = 0;
+                }
+                Err(err) => {
+                    attempts += 1;
+                    if attempts > MAX_READ_RETRIES {
+                        return Err(err).context("failed to read batch from s3");
+                    }
+                    log::warn!(
+                        "S3 stream read error at offset {}: {:?} (retry {}/{})",
+                        data_offset + bytes_read as u64,
+                        err,
+                        attempts,
+                        MAX_READ_RETRIES
+                    );
+                    body = open_body_at(
+                        &client,
+                        &bucket,
+                        &key,
+                        data_offset + bytes_read as u64,
+                    )
+                    .await?;
+                }
+            }
+        }
 
         let mut vectors = Vec::with_capacity(this_batch);
         let mut offset = 0;
-        for _ in 0..this_batch {
+        for i in 0..this_batch {
             let mut data = Vec::with_capacity(dim);
             for _ in 0..dim {
                 let bytes: [u8; 4] = buffer[offset..offset + 4].try_into().unwrap();
                 data.push(f32::from_le_bytes(bytes));
                 offset += 4;
             }
-            vectors.push(Vector::new(current_idx as u64, data));
-            current_idx += 1;
+            let id = current_idx as u64 + i as u64;
+            vectors.push(Vector::new(id, data));
         }
 
         if tx.send(Ok(vectors)).await.is_err() {

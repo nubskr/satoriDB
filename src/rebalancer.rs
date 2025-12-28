@@ -6,6 +6,7 @@ use crate::quantizer::Quantizer;
 use crate::router::{Router, RoutingTable};
 use crate::storage::{Bucket, BucketMeta, BucketMetaStatus, Storage, Vector};
 use crate::vector_index::VectorIndex;
+use crate::wal::config::PREFIX_META_SIZE;
 use crate::wal::runtime::Walrus;
 use anyhow::Result;
 use futures::executor::block_on;
@@ -64,6 +65,7 @@ pub(crate) struct RebalanceState {
     centroids: RwLock<HashMap<u64, Vec<f32>>>,
     bucket_sizes: RwLock<HashMap<u64, usize>>,
     next_bucket_id: AtomicU64,
+    trim_counter: AtomicU64,
     bucket_locks: Arc<BucketLocks>,
 }
 
@@ -84,6 +86,7 @@ impl RebalanceState {
             centroids: RwLock::new(HashMap::new()),
             bucket_sizes: RwLock::new(HashMap::new()),
             next_bucket_id: AtomicU64::new(0),
+            trim_counter: AtomicU64::new(0),
             bucket_locks,
         }
     }
@@ -132,6 +135,40 @@ impl RebalanceState {
 
     fn lock_for(&self, bucket_id: u64) -> Arc<futures::lock::Mutex<()>> {
         self.bucket_locks.lock_for(bucket_id)
+    }
+
+    fn seed_centroids_with_counts(
+        &self,
+        seeds: Vec<(u64, Vec<f32>, usize)>,
+        write_meta: bool,
+    ) -> Result<()> {
+        let mut max_id = 0;
+        {
+            let mut map = self.centroids.write();
+            let mut sizes = self.bucket_sizes.write();
+            map.clear();
+            sizes.clear();
+            for (id, centroid, count) in seeds.into_iter() {
+                if id > max_id {
+                    max_id = id;
+                }
+                map.insert(id, centroid);
+                sizes.insert(id, count);
+            }
+        }
+        self.next_bucket_id.store(max_id + 1, Ordering::Release);
+        self.rebuild_router(Vec::new());
+
+        if write_meta {
+            let ids: Vec<u64> = self.centroids.read().keys().copied().collect();
+            for id in ids {
+                let _ = block_on(self.storage.put_bucket_meta(&BucketMeta {
+                    bucket_id: id,
+                    status: BucketMetaStatus::Active,
+                }));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn load_bucket_vectors(&self, bucket_id: u64) -> Option<Vec<Vector>> {
@@ -277,6 +314,7 @@ impl RebalanceState {
     }
 
     fn handle_split_sync(&self, bucket_id: u64) {
+        log::debug!("rebalance: handle_split_sync started for bucket {}", bucket_id);
         if should_fail(RebalanceTaskKind::Split) {
             debug!(
                 "rebalance: injected failure for split on bucket {}",
@@ -285,18 +323,25 @@ impl RebalanceState {
             return;
         }
 
-        // 1. Peek sample to determine centroids (No lock needed for Walrus peek)
+        // 1. Peek sample to determine centroids.
         let topic = crate::storage::Storage::topic_for(bucket_id);
         // Peek up to 1MB for sampling
         let sample_entries = match self
             .wal
             .batch_read_for_topic(&topic, 1024 * 1024, false, None)
         {
-            Ok(e) => e,
-            Err(_) => return, // Likely empty or IO error
+            Ok(e) => {
+                log::debug!("rebalance: peeked {} sample entries for bucket {}", e.len(), bucket_id);
+                e
+            },
+            Err(e) => {
+                log::error!("rebalance: failed to peek sample for bucket {}: {:?}", bucket_id, e);
+                return; 
+            }, // Likely empty or IO error
         };
 
         if sample_entries.is_empty() {
+            log::debug!("rebalance: sample empty for bucket {}, aborting split", bucket_id);
             return;
         }
 
@@ -368,7 +413,7 @@ impl RebalanceState {
         // 2. Incremental Split Loop
         loop {
             loop_iters += 1;
-            if start_time.elapsed() > Duration::from_secs(60) {
+            if start_time.elapsed() > Duration::from_secs(5 * 60 * 60) {
                 error!(
                     "rebalance: trimming bucket {} timed out after {}s! Moved {}. Orphaned remaining.",
                     bucket_id,
@@ -380,17 +425,16 @@ impl RebalanceState {
 
             // Peek batch (Checkpoint = false)
             // Use a reasonable batch size (e.g. 4MB) to balance throughput and latency
-            let batch_entries =
-                match self
-                    .wal
-                    .batch_read_for_topic(&topic, 4 * 1024 * 1024, false, None)
-                {
-                    Ok(e) => e,
-                    Err(e) => {
-                        error!("rebalance: read failed for {}: {:?}", topic, e);
-                        break;
-                    }
-                };
+            let batch_entries = match self
+                .wal
+                .batch_read_for_topic(&topic, 4 * 1024 * 1024, false, None)
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    error!("rebalance: read failed for {}: {:?}", topic, e);
+                    break;
+                }
+            };
 
             if batch_entries.is_empty() {
                 break;
@@ -450,31 +494,50 @@ impl RebalanceState {
 
             total_moved += batch_entries.len();
 
-            // Commit (Consume)
-            // We use batch_read_for_topic with checkpoint=true to consume efficiently.
-            // StrictlyAtOnce will persist the offset once per batch.
-            let remaining = batch_entries.len();
-
-            // Calculate exact payload bytes to consume so we don't over-consume new writes
+            // Commit (Checkpoint = true)
+            // We must consume EXACTLY the same number of entries we just processed.
             let payload_bytes: usize = batch_entries.iter().map(|e| e.data.len()).sum();
-
             let mut commit_error = false;
-            if remaining > 0 {
-                match self
-                    .wal
-                    .batch_read_for_topic(&topic, payload_bytes, true, None)
-                {
+            let mut remaining_entries = batch_entries.len();
+            // Walrus batch read limit applies to payload bytes only.
+            let mut remaining_bytes = payload_bytes;
+
+            while remaining_entries > 0 {
+                match self.wal.batch_read_for_topic_with_limit(
+                    &topic,
+                    remaining_bytes,
+                    Some(remaining_entries as u32),
+                    true,
+                    None,
+                ) {
                     Ok(batch) => {
-                        if batch.len() != remaining {
+                        if batch.is_empty() {
                             error!(
-                                "rebalance: commit mismatch for {}: expected {} entries, consumed {}",
-                                topic, remaining, batch.len()
+                                "rebalance: commit stalled for {}: expected {} more entries",
+                                topic, remaining_entries
                             );
+                            commit_error = true;
+                            break;
                         }
+
+                        let consumed_entries = batch.len();
+                        if consumed_entries > remaining_entries {
+                            error!(
+                                "rebalance: commit over-consumed for {}: expected {} entries, consumed {}",
+                                topic, remaining_entries, consumed_entries
+                            );
+                            commit_error = true;
+                            break;
+                        }
+
+                        let consumed_bytes: usize = batch.iter().map(|e| e.data.len()).sum();
+                        remaining_entries -= consumed_entries;
+                        remaining_bytes = remaining_bytes.saturating_sub(consumed_bytes);
                     }
                     Err(e) => {
                         error!("rebalance: commit failed for {}: {:?}", topic, e);
                         commit_error = true;
+                        break;
                     }
                 }
             }
@@ -488,12 +551,22 @@ impl RebalanceState {
             }
         }
 
-        log::info!(
-            "rebalance: finished trim of {} (moved {} entries in {}s)",
-            bucket_id,
-            total_moved,
-            start_time.elapsed().as_secs_f32()
-        );
+        let trim_count = self.trim_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if trim_count.is_multiple_of(10) {
+            log::info!(
+                "rebalance: finished trim of {} (moved {} entries in {}s)",
+                bucket_id,
+                total_moved,
+                start_time.elapsed().as_secs_f32()
+            );
+        } else {
+            log::debug!(
+                "rebalance: finished trim of {} (moved {} entries in {}s)",
+                bucket_id,
+                total_moved,
+                start_time.elapsed().as_secs_f32()
+            );
+        }
     }
 }
 
@@ -530,6 +603,7 @@ impl RebalanceWorker {
         bucket_locks: Arc<BucketLocks>,
     ) -> Self {
         let threshold = read_rebalance_threshold();
+        let poll_ms = read_rebalance_poll_ms();
         Self::spawn_with_threshold(
             storage,
             vector_index,
@@ -538,9 +612,11 @@ impl RebalanceWorker {
             pin_cpu,
             bucket_locks,
             threshold,
+            poll_ms,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_threshold(
         storage: Storage,
         vector_index: Arc<VectorIndex>,
@@ -549,6 +625,7 @@ impl RebalanceWorker {
         pin_cpu: Option<usize>,
         bucket_locks: Arc<BucketLocks>,
         threshold: usize,
+        poll_ms: u64,
     ) -> Self {
         let state = Arc::new(RebalanceState::new(
             storage,
@@ -566,21 +643,31 @@ impl RebalanceWorker {
                 let builder =
                     glommio::LocalExecutorBuilder::new(glommio::Placement::Fixed(cpu)).name(&name);
                 std::thread::spawn(move || {
-                    builder
-                        .make()
-                        .expect("failed to create rebalance executor")
-                        .run(run_autonomous_loop(state_clone, delete_rx, threshold));
+                    let executor = builder.make().expect("failed to create rebalance executor");
+                    if poll_ms == 0 {
+                        executor.run(run_delete_loop(state_clone, delete_rx));
+                    } else {
+                        executor.run(run_autonomous_loop(
+                            state_clone, delete_rx, threshold, poll_ms,
+                        ));
+                    }
                 });
             }
             None => {
                 thread::Builder::new()
                     .name(name.clone())
                     .spawn(move || {
-                        glommio::LocalExecutorBuilder::default()
+                        let executor = glommio::LocalExecutorBuilder::default()
                             .name(&name)
                             .make()
-                            .expect("failed to create default rebalance executor")
-                            .run(run_autonomous_loop(state_clone, delete_rx, threshold));
+                            .expect("failed to create default rebalance executor");
+                        if poll_ms == 0 {
+                            executor.run(run_delete_loop(state_clone, delete_rx));
+                        } else {
+                            executor.run(run_autonomous_loop(
+                                state_clone, delete_rx, threshold, poll_ms,
+                            ));
+                        }
                     })
                     .expect("rebalance worker");
             }
@@ -637,11 +724,63 @@ impl RebalanceWorker {
         Ok(())
     }
 
+    pub fn seed_centroids_with_counts(
+        &self,
+        seeds: Vec<(u64, Vec<f32>, usize)>,
+        write_meta: bool,
+    ) -> Result<()> {
+        self.state.seed_centroids_with_counts(seeds, write_meta)
+    }
+
     pub fn snapshot_sizes(&self) -> HashMap<u64, usize> {
         self.state.refresh_sizes()
     }
 
     pub fn close(&self) {}
+
+    /// Run aggressive rebalancing until no bucket exceeds the configured threshold.
+    /// This is synchronous and will use all available CPU cores.
+    pub fn aggressive_rebalance_blocking(&self) -> anyhow::Result<usize> {
+        let threshold = read_rebalance_threshold();
+        let max_workers = num_cpus::get().max(1);
+        let mut total_splits = 0usize;
+
+        loop {
+            let mut oversized: Vec<(u64, usize)> = self
+                .state
+                .refresh_sizes()
+                .into_iter()
+                .filter(|(_, size)| *size > threshold)
+                .collect();
+
+            if oversized.is_empty() {
+                break;
+            }
+
+            oversized.sort_by(|a, b| b.1.cmp(&a.1));
+            total_splits += oversized.len();
+
+            let workers = max_workers.min(oversized.len());
+            let chunk_size = oversized.len().div_ceil(workers);
+            let mut handles = Vec::with_capacity(workers);
+
+            for chunk in oversized.chunks(chunk_size) {
+                let state = self.state.clone();
+                let ids: Vec<u64> = chunk.iter().map(|(id, _)| *id).collect();
+                handles.push(thread::spawn(move || {
+                    for id in ids {
+                        state.handle_split_sync(id);
+                    }
+                }));
+            }
+
+            for handle in handles {
+                let _ = handle.join();
+            }
+        }
+
+        Ok(total_splits)
+    }
 
     pub async fn delete(&self, vector_id: u64, bucket_hint: Option<u64>) -> anyhow::Result<()> {
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -699,6 +838,7 @@ async fn run_autonomous_loop(
     state: Arc<RebalanceState>,
     delete_rx: async_channel::Receiver<DeleteCommand>,
     threshold: usize,
+    poll_ms: u64,
 ) {
     loop {
         while let Ok(cmd) = delete_rx.try_recv() {
@@ -725,9 +865,9 @@ async fn run_autonomous_loop(
                     state_ref.handle_split_sync(max_id);
                 })
                 .await;
-        } else {
-            glommio::timer::Timer::new(Duration::from_millis(500)).await;
         }
+
+        glommio::timer::Timer::new(Duration::from_millis(poll_ms)).await;
     }
 }
 
@@ -736,6 +876,13 @@ fn read_rebalance_threshold() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000)
+}
+
+fn read_rebalance_poll_ms() -> u64 {
+    std::env::var("SATORI_REBALANCE_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300_000)
 }
 
 async fn perform_delete(
@@ -817,28 +964,28 @@ async fn perform_delete(
     // Advance WAL checkpoints for the entries that existed prior to this rewrite so old blocks can
     // be reclaimed without consuming the newly written replacement/tombstone. Read in bounded
     // batches to avoid sweeping the fresh entries that were just appended.
-    let mut remaining = entries_before;
-    while remaining > 0 {
+    let mut remaining_entries = entries_before;
+    while remaining_entries > 0 {
         const MIN_ENTRY_BYTES: usize = 24; // len prefix + id + dim (no payload)
-        let max_entries = remaining.min(2000) as usize;
-        let max_bytes = max_entries
-            .saturating_mul(MIN_ENTRY_BYTES)
+        let max_entries = remaining_entries.min(2000);
+        // Walrus limits by payload bytes.
+        let max_bytes = (max_entries as usize)
+            .saturating_mul(1024) // Assume 1KB avg vector size
             .max(MIN_ENTRY_BYTES);
 
-        match state
-            .storage
-            .wal
-            .batch_read_for_topic(&topic, max_bytes, true, None)
-        {
+        // We use checkpoint=true to consume them.
+        match state.storage.wal.batch_read_for_topic_with_limit(
+            &topic,
+            max_bytes,
+            Some(remaining_entries.min(2000) as u32),
+            true,
+            None,
+        ) {
             Ok(batch) => {
                 if batch.is_empty() {
                     break;
                 }
-                let consumed = batch.len().min(max_entries) as u64;
-                remaining = remaining.saturating_sub(consumed);
-                if consumed == 0 {
-                    break;
-                }
+                remaining_entries = remaining_entries.saturating_sub(batch.len() as u64);
             }
             Err(e) => {
                 warn!("rebalance: checkpoint drain failed for {}: {:?}", topic, e);
@@ -1283,6 +1430,7 @@ mod tests {
 
         // Set low threshold to trigger rebalancing easily
         let threshold = 10;
+        let poll_ms = 500;
 
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal_keep");
@@ -1309,6 +1457,7 @@ mod tests {
             None,
             bucket_locks.clone(),
             threshold,
+            poll_ms,
         );
 
         // 1. Prime Bucket 0
@@ -1327,7 +1476,7 @@ mod tests {
         // Threshold is 10, we put 20. Should split.
         let mut split_count = 0;
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(15) {
+        while start.elapsed() < Duration::from_secs(30) {
             let sizes = worker.snapshot_sizes();
             // If split happened, we have > 1 bucket.
             // And hopefully Bucket 0 is empty (or near empty).
@@ -1337,12 +1486,16 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
+        if split_count == 0 {
+            let sizes = worker.snapshot_sizes();
+            panic!("First split failed to trigger after 30s. Buckets: {:?}", sizes);
+        }
         assert!(split_count > 0, "First split failed to trigger");
 
         // 3. Pump data into a NEW bucket (e.g. Bucket 1) to force another split
         // Find a valid bucket ID that isn't 0
         let sizes = worker.snapshot_sizes();
-        let target_id = sizes.keys().find(|&&id| id != 0).cloned().unwrap();
+        let target_id = sizes.keys().find(|&&id| id != 0).cloned().expect("should have non-zero bucket");
 
         let pump_vectors: Vec<Vector> = (100..150)
             .map(|i| Vector::new(i, vec![100.0 + i as f32, 100.0 + i as f32]))
@@ -1354,13 +1507,18 @@ mod tests {
         let initial_buckets = sizes.len();
         let start = Instant::now();
         let mut second_split = false;
-        while start.elapsed() < Duration::from_secs(15) {
+        while start.elapsed() < Duration::from_secs(30) {
             let current_sizes = worker.snapshot_sizes();
             if current_sizes.len() > initial_buckets {
                 second_split = true;
                 break;
             }
             thread::sleep(Duration::from_millis(50));
+        }
+
+        if !second_split {
+            let sizes = worker.snapshot_sizes();
+            panic!("Second split failed to trigger after 30s. Initial buckets: {}, Current buckets: {:?}, Target bucket: {}", initial_buckets, sizes, target_id);
         }
 
         assert!(
@@ -1394,7 +1552,8 @@ mod tests {
 
         // 1. Setup with low threshold to force frequent splits
 
-        let threshold = 100;
+                let threshold = 100;
+                let poll_ms = 500;
 
         let dir = tempdir().unwrap();
 
@@ -1418,11 +1577,12 @@ mod tests {
             storage.clone(),
             vector_index.clone(),
             bucket_index.clone(),
-            routing.clone(),
-            None,
-            bucket_locks.clone(),
-            threshold,
-        );
+                    routing.clone(),
+                    None,
+                    bucket_locks.clone(),
+                    threshold,
+                    poll_ms,
+                );
 
         // 2. Prime Bucket 0
 
