@@ -99,9 +99,9 @@ pub mod gnd;
 #[doc(hidden)]
 pub mod indexer;
 #[doc(hidden)]
-pub mod ingest_counter;
-#[doc(hidden)]
 pub mod ingest_control;
+#[doc(hidden)]
+pub mod ingest_counter;
 #[doc(hidden)]
 pub mod quantizer;
 #[doc(hidden)]

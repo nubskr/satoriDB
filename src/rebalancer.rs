@@ -6,7 +6,6 @@ use crate::quantizer::Quantizer;
 use crate::router::{Router, RoutingTable};
 use crate::storage::{Bucket, BucketMeta, BucketMetaStatus, Storage, Vector};
 use crate::vector_index::VectorIndex;
-use crate::wal::config::PREFIX_META_SIZE;
 use crate::wal::runtime::Walrus;
 use anyhow::Result;
 use futures::executor::block_on;
@@ -314,7 +313,10 @@ impl RebalanceState {
     }
 
     fn handle_split_sync(&self, bucket_id: u64) {
-        log::debug!("rebalance: handle_split_sync started for bucket {}", bucket_id);
+        log::debug!(
+            "rebalance: handle_split_sync started for bucket {}",
+            bucket_id
+        );
         if should_fail(RebalanceTaskKind::Split) {
             debug!(
                 "rebalance: injected failure for split on bucket {}",
@@ -331,17 +333,28 @@ impl RebalanceState {
             .batch_read_for_topic(&topic, 1024 * 1024, false, None)
         {
             Ok(e) => {
-                log::debug!("rebalance: peeked {} sample entries for bucket {}", e.len(), bucket_id);
+                log::debug!(
+                    "rebalance: peeked {} sample entries for bucket {}",
+                    e.len(),
+                    bucket_id
+                );
                 e
-            },
+            }
             Err(e) => {
-                log::error!("rebalance: failed to peek sample for bucket {}: {:?}", bucket_id, e);
-                return; 
-            }, // Likely empty or IO error
+                log::error!(
+                    "rebalance: failed to peek sample for bucket {}: {:?}",
+                    bucket_id,
+                    e
+                );
+                return;
+            } // Likely empty or IO error
         };
 
         if sample_entries.is_empty() {
-            log::debug!("rebalance: sample empty for bucket {}, aborting split", bucket_id);
+            log::debug!(
+                "rebalance: sample empty for bucket {}, aborting split",
+                bucket_id
+            );
             return;
         }
 
@@ -425,16 +438,17 @@ impl RebalanceState {
 
             // Peek batch (Checkpoint = false)
             // Use a reasonable batch size (e.g. 4MB) to balance throughput and latency
-            let batch_entries = match self
-                .wal
-                .batch_read_for_topic(&topic, 4 * 1024 * 1024, false, None)
-            {
-                Ok(e) => e,
-                Err(e) => {
-                    error!("rebalance: read failed for {}: {:?}", topic, e);
-                    break;
-                }
-            };
+            let batch_entries =
+                match self
+                    .wal
+                    .batch_read_for_topic(&topic, 4 * 1024 * 1024, false, None)
+                {
+                    Ok(e) => e,
+                    Err(e) => {
+                        error!("rebalance: read failed for {}: {:?}", topic, e);
+                        break;
+                    }
+                };
 
             if batch_entries.is_empty() {
                 break;
@@ -648,7 +662,10 @@ impl RebalanceWorker {
                         executor.run(run_delete_loop(state_clone, delete_rx));
                     } else {
                         executor.run(run_autonomous_loop(
-                            state_clone, delete_rx, threshold, poll_ms,
+                            state_clone,
+                            delete_rx,
+                            threshold,
+                            poll_ms,
                         ));
                     }
                 });
@@ -665,7 +682,10 @@ impl RebalanceWorker {
                             executor.run(run_delete_loop(state_clone, delete_rx));
                         } else {
                             executor.run(run_autonomous_loop(
-                                state_clone, delete_rx, threshold, poll_ms,
+                                state_clone,
+                                delete_rx,
+                                threshold,
+                                poll_ms,
                             ));
                         }
                     })
@@ -1488,14 +1508,21 @@ mod tests {
         }
         if split_count == 0 {
             let sizes = worker.snapshot_sizes();
-            panic!("First split failed to trigger after 30s. Buckets: {:?}", sizes);
+            panic!(
+                "First split failed to trigger after 30s. Buckets: {:?}",
+                sizes
+            );
         }
         assert!(split_count > 0, "First split failed to trigger");
 
         // 3. Pump data into a NEW bucket (e.g. Bucket 1) to force another split
         // Find a valid bucket ID that isn't 0
         let sizes = worker.snapshot_sizes();
-        let target_id = sizes.keys().find(|&&id| id != 0).cloned().expect("should have non-zero bucket");
+        let target_id = sizes
+            .keys()
+            .find(|&&id| id != 0)
+            .cloned()
+            .expect("should have non-zero bucket");
 
         let pump_vectors: Vec<Vector> = (100..150)
             .map(|i| Vector::new(i, vec![100.0 + i as f32, 100.0 + i as f32]))
@@ -1552,8 +1579,8 @@ mod tests {
 
         // 1. Setup with low threshold to force frequent splits
 
-                let threshold = 100;
-                let poll_ms = 500;
+        let threshold = 100;
+        let poll_ms = 500;
 
         let dir = tempdir().unwrap();
 
@@ -1577,12 +1604,12 @@ mod tests {
             storage.clone(),
             vector_index.clone(),
             bucket_index.clone(),
-                    routing.clone(),
-                    None,
-                    bucket_locks.clone(),
-                    threshold,
-                    poll_ms,
-                );
+            routing.clone(),
+            None,
+            bucket_locks.clone(),
+            threshold,
+            poll_ms,
+        );
 
         // 2. Prime Bucket 0
 

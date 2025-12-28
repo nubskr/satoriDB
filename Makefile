@@ -40,7 +40,7 @@ clean-db:
 
 benchmark-s3: clean-db $(QUERY) $(GND)
 	@echo "Running benchmark with S3 streaming (requires .env with R2 credentials)..."
-	ulimit -n 524288; WALRUS_QUIET=1 RUST_LOG=info SATORI_REBALANCE_POLL_MS=0 SATORI_RUN_BENCH=1 $(CARGO) run --release --bin satoridb
+	ulimit -n 524288; WALRUS_QUIET=1 RUST_LOG=info SATORI_REBALANCE_POLL_MS=1000 SATORI_RUN_BENCH=1 $(CARGO) run --release --bin satoridb
 
 clean-benchmark-data:
 	rm -f $(BASE) $(BASE_F32) $(QUERY) $(GND)

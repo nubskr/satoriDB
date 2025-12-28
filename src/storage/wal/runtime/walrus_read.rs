@@ -13,7 +13,10 @@ const BLOCK_ID_FLAG: u64 = 1u64 << 62;
 
 #[derive(Clone, Debug)]
 pub enum ReadCursor {
-    Sealed { block_id: u64, offset: u64 },
+    Sealed {
+        block_id: u64,
+        offset: u64,
+    },
     Tail {
         block_id: u64,
         offset: u64,
@@ -413,7 +416,13 @@ impl Walrus {
         start_offset: Option<u64>,
     ) -> io::Result<Vec<Entry>> {
         Ok(self
-            .batch_read_for_topic_internal(col_name, max_bytes, checkpoint, start_offset, max_entries)?
+            .batch_read_for_topic_internal(
+                col_name,
+                max_bytes,
+                checkpoint,
+                start_offset,
+                max_entries,
+            )?
             .entries)
     }
 
@@ -1173,10 +1182,7 @@ impl Walrus {
                     sealed_len: chain_len_at_plan as u64,
                 })
             } else {
-                let block_id = chain
-                    .get(final_block_idx)
-                    .map(|b| b.id)
-                    .unwrap_or(0);
+                let block_id = chain.get(final_block_idx).map(|b| b.id).unwrap_or(0);
                 Some(ReadCursor::Sealed {
                     block_id,
                     offset: final_block_offset,

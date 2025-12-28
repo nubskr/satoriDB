@@ -139,13 +139,8 @@ async fn run_s3_stream(
                         attempts,
                         MAX_READ_RETRIES
                     );
-                    body = open_body_at(
-                        &client,
-                        &bucket,
-                        &key,
-                        data_offset + bytes_read as u64,
-                    )
-                    .await?;
+                    body = open_body_at(&client, &bucket, &key, data_offset + bytes_read as u64)
+                        .await?;
                 }
                 Ok(n) => {
                     bytes_read += n;
@@ -163,13 +158,8 @@ async fn run_s3_stream(
                         attempts,
                         MAX_READ_RETRIES
                     );
-                    body = open_body_at(
-                        &client,
-                        &bucket,
-                        &key,
-                        data_offset + bytes_read as u64,
-                    )
-                    .await?;
+                    body = open_body_at(&client, &bucket, &key, data_offset + bytes_read as u64)
+                        .await?;
                 }
             }
         }
