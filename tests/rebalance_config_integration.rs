@@ -30,7 +30,7 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 #[test]
 fn rebalance_respects_target_size_threshold() -> Result<()> {
     // Force split at 20
-    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "20");
+    let threshold = 20;
 
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
@@ -39,13 +39,15 @@ fn rebalance_respects_target_size_threshold() -> Result<()> {
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let bucket_locks = Arc::new(BucketLocks::new());
-    let worker = RebalanceWorker::spawn(
+    let worker = RebalanceWorker::spawn_with_threshold(
         storage.clone(),
         vector_index,
         bucket_index,
         routing.clone(),
         None,
         bucket_locks,
+        threshold,
+        100,
     );
 
     // Build a bucket just over a custom target size.

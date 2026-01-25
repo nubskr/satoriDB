@@ -306,7 +306,7 @@ fn centroid_of(vectors: &[Vector], dim: usize) -> Vec<f32> {
 }
 
 #[inline(always)]
-fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = 0.0f32;
     for i in 0..a.len() {
         let diff = a[i] - b[i];

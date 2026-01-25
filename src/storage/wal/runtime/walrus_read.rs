@@ -8,9 +8,37 @@ use std::sync::{Arc, RwLock};
 
 use rkyv::{AlignedVec, Deserialize};
 
+const TAIL_FLAG: u64 = 1u64 << 63;
+const BLOCK_ID_FLAG: u64 = 1u64 << 62;
+
+#[derive(Clone, Debug)]
+pub enum ReadCursor {
+    Sealed {
+        block_id: u64,
+        offset: u64,
+    },
+    Tail {
+        block_id: u64,
+        offset: u64,
+        sealed_len: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchReadResult {
+    pub entries: Vec<Entry>,
+    pub cursor: Option<ReadCursor>,
+    pub entries_consumed: u32,
+}
+
+struct BatchReadOutput {
+    entries: Vec<Entry>,
+    cursor: Option<ReadCursor>,
+    entries_consumed: u32,
+}
+
 impl Walrus {
     pub fn read_next(&self, col_name: &str, checkpoint: bool) -> io::Result<Option<Entry>> {
-        const TAIL_FLAG: u64 = 1u64 << 63;
         let info_arc = if let Some(arc) = {
             let map = self
                 .reader
@@ -57,11 +85,27 @@ impl Walrus {
             if let Ok(idx_guard) = self.read_offset_index.read() {
                 if let Some(pos) = idx_guard.get(col_name) {
                     if (pos.cur_block_idx & TAIL_FLAG) != 0 {
-                        let tail_block_id = pos.cur_block_idx & (!TAIL_FLAG);
+                        let tail_block_id = pos.cur_block_idx & !(TAIL_FLAG | BLOCK_ID_FLAG);
                         persisted_tail = Some((tail_block_id, pos.cur_block_offset));
                         // sealed state is considered caught up
                         info.cur_block_idx = info.chain.len();
                         info.cur_block_offset = 0;
+                    } else if (pos.cur_block_idx & BLOCK_ID_FLAG) != 0 {
+                        let block_id = pos.cur_block_idx & !BLOCK_ID_FLAG;
+                        if let Some(idx) = info
+                            .chain
+                            .iter()
+                            .enumerate()
+                            .find(|(_, b)| b.id == block_id)
+                            .map(|(idx, _)| idx)
+                        {
+                            let used = info.chain[idx].used;
+                            info.cur_block_idx = idx;
+                            info.cur_block_offset = pos.cur_block_offset.min(used);
+                        } else {
+                            info.cur_block_idx = 0;
+                            info.cur_block_offset = 0;
+                        }
                     } else {
                         let mut ib = pos.cur_block_idx as usize;
                         if ib > info.chain.len() {
@@ -358,6 +402,53 @@ impl Walrus {
         checkpoint: bool,
         start_offset: Option<u64>,
     ) -> io::Result<Vec<Entry>> {
+        Ok(self
+            .batch_read_for_topic_internal(col_name, max_bytes, checkpoint, start_offset, None)?
+            .entries)
+    }
+
+    pub fn batch_read_for_topic_with_limit(
+        &self,
+        col_name: &str,
+        max_bytes: usize,
+        max_entries: Option<u32>,
+        checkpoint: bool,
+        start_offset: Option<u64>,
+    ) -> io::Result<Vec<Entry>> {
+        Ok(self
+            .batch_read_for_topic_internal(
+                col_name,
+                max_bytes,
+                checkpoint,
+                start_offset,
+                max_entries,
+            )?
+            .entries)
+    }
+
+    pub fn batch_read_for_topic_with_cursor(
+        &self,
+        col_name: &str,
+        max_bytes: usize,
+        max_entries: Option<u32>,
+    ) -> io::Result<BatchReadResult> {
+        let output =
+            self.batch_read_for_topic_internal(col_name, max_bytes, false, None, max_entries)?;
+        Ok(BatchReadResult {
+            entries: output.entries,
+            cursor: output.cursor,
+            entries_consumed: output.entries_consumed,
+        })
+    }
+
+    fn batch_read_for_topic_internal(
+        &self,
+        col_name: &str,
+        max_bytes: usize,
+        checkpoint: bool,
+        start_offset: Option<u64>,
+        max_entries: Option<u32>,
+    ) -> io::Result<BatchReadOutput> {
         // Helper struct for read planning
         struct ReadPlan {
             blk: Block,
@@ -366,8 +457,6 @@ impl Walrus {
             is_tail: bool,
             chain_idx: Option<usize>,
         }
-
-        const TAIL_FLAG: u64 = 1u64 << 63;
 
         // Pre-snapshot active writer state to avoid lock-order inversion later
         let writer_snapshot: Option<(Block, u64)> = {
@@ -549,12 +638,28 @@ impl Walrus {
                 if let Ok(idx_guard) = self.read_offset_index.read() {
                     if let Some(pos) = idx_guard.get(col_name) {
                         if (pos.cur_block_idx & TAIL_FLAG) != 0 {
-                            let tail_bid = pos.cur_block_idx & (!TAIL_FLAG);
+                            let tail_bid = pos.cur_block_idx & !(TAIL_FLAG | BLOCK_ID_FLAG);
                             info.tail_block_id = tail_bid;
                             info.tail_offset = pos.cur_block_offset;
                             info.cur_block_idx = info.chain.len();
                             info.cur_block_offset = 0;
                             persisted_tail_for_fold = Some((tail_bid, pos.cur_block_offset));
+                        } else if (pos.cur_block_idx & BLOCK_ID_FLAG) != 0 {
+                            let block_id = pos.cur_block_idx & !BLOCK_ID_FLAG;
+                            if let Some(idx) = info
+                                .chain
+                                .iter()
+                                .enumerate()
+                                .find(|(_, b)| b.id == block_id)
+                                .map(|(idx, _)| idx)
+                            {
+                                let used = info.chain[idx].used;
+                                info.cur_block_idx = idx;
+                                info.cur_block_offset = pos.cur_block_offset.min(used);
+                            } else {
+                                info.cur_block_idx = 0;
+                                info.cur_block_offset = 0;
+                            }
                         } else {
                             let mut ib = pos.cur_block_idx as usize;
                             if ib > info.chain.len() {
@@ -805,7 +910,11 @@ impl Walrus {
         }
 
         if plan.is_empty() {
-            return Ok(Vec::new());
+            return Ok(BatchReadOutput {
+                entries: Vec::new(),
+                cursor: None,
+                entries_consumed: 0,
+            });
         }
 
         // Hold lock across IO/parse when the read is stateful+checkpointing, to avoid duplicate consumption
@@ -847,12 +956,22 @@ impl Walrus {
             if entries.len() >= MAX_BATCH_ENTRIES {
                 break;
             }
+            if let Some(limit) = max_entries {
+                if entries_parsed >= limit {
+                    break;
+                }
+            }
             let buffer = &buffers[plan_idx];
             let mut buf_offset = 0usize;
 
             while buf_offset < buffer.len() {
                 if entries.len() >= MAX_BATCH_ENTRIES {
                     break;
+                }
+                if let Some(limit) = max_entries {
+                    if entries_parsed >= limit {
+                        break;
+                    }
                 }
                 // Try to read metadata header
                 if buf_offset + PREFIX_META_SIZE > buffer.len() {
@@ -948,6 +1067,12 @@ impl Walrus {
                     final_block_offset = in_block_offset;
                 }
 
+                if let Some(limit) = max_entries {
+                    if entries_parsed >= limit {
+                        break;
+                    }
+                }
+
                 buf_offset += entry_consumed;
             }
         }
@@ -956,7 +1081,7 @@ impl Walrus {
         if entries_parsed > 0 {
             enum PersistTarget {
                 Tail { blk_id: u64, off: u64 },
-                Sealed { idx: u64, off: u64 },
+                Sealed { pos: u64, off: u64 },
                 None,
             }
             let mut target = PersistTarget::None;
@@ -996,8 +1121,13 @@ impl Walrus {
                         info.cur_block_idx = final_block_idx;
                         info.cur_block_offset = final_block_offset;
                         if should_persist_disk {
+                            let pos = info
+                                .chain
+                                .get(final_block_idx)
+                                .map(|b| BLOCK_ID_FLAG | b.id)
+                                .unwrap_or(final_block_idx as u64);
                             target = PersistTarget::Sealed {
-                                idx: final_block_idx as u64,
+                                pos,
                                 off: final_block_offset,
                             };
                         }
@@ -1030,9 +1160,9 @@ impl Walrus {
                             let _ = idx_guard.set(col_name.to_string(), blk_id | TAIL_FLAG, off);
                         }
                     }
-                    PersistTarget::Sealed { idx, off } => {
+                    PersistTarget::Sealed { pos, off } => {
                         if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ = idx_guard.set(col_name.to_string(), idx, off);
+                            let _ = idx_guard.set(col_name.to_string(), pos, off);
                         }
                     }
                     PersistTarget::None => {}
@@ -1044,6 +1174,28 @@ impl Walrus {
             self.decrement_topic_entry_count(col_name, entries_parsed as u64);
         }
 
-        Ok(entries)
+        let cursor = if entries_parsed > 0 {
+            if saw_tail {
+                Some(ReadCursor::Tail {
+                    block_id: final_tail_block_id,
+                    offset: final_tail_offset,
+                    sealed_len: chain_len_at_plan as u64,
+                })
+            } else {
+                let block_id = chain.get(final_block_idx).map(|b| b.id).unwrap_or(0);
+                Some(ReadCursor::Sealed {
+                    block_id,
+                    offset: final_block_offset,
+                })
+            }
+        } else {
+            None
+        };
+
+        Ok(BatchReadOutput {
+            entries,
+            cursor,
+            entries_consumed: entries_parsed,
+        })
     }
 }

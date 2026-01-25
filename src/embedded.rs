@@ -1,5 +1,6 @@
 use crate::bucket_index::BucketIndex;
 use crate::bucket_locks::BucketLocks;
+use crate::ingest_control;
 use crate::rebalancer::RebalanceWorker;
 use crate::router::RoutingTable;
 use crate::router_manager::{spawn_router_manager, RouterCommand, RouterShutdownRequest};
@@ -19,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 // ============================================================================
 // Builder
@@ -28,11 +30,16 @@ use std::thread;
 ///
 /// # Example
 ///
-/// ```ignore
-/// let db = SatoriDb::builder("my_app")
+/// ```rust,no_run
+/// use satoridb::SatoriDb;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let _db = SatoriDb::builder("my_app")
 ///     .workers(4)
 ///     .fsync_ms(200)
 ///     .build()?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct SatoriDbBuilder {
     name: String,
@@ -139,9 +146,10 @@ impl SatoriDbBuilder {
 ///
 /// # Quick Start
 ///
-/// ```ignore
+/// ```rust,no_run
 /// use satoridb::SatoriDb;
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let db = SatoriDb::open("my_app")?;
 ///
 /// db.insert(1, vec![0.1, 0.2, 0.3])?;
@@ -152,6 +160,8 @@ impl SatoriDbBuilder {
 ///     println!("id={id} distance={distance}");
 /// }
 /// // Auto-shutdown on drop
+/// # Ok(())
+/// # }
 /// ```
 pub struct SatoriDb {
     handle: SatoriHandle,
@@ -172,8 +182,13 @@ impl SatoriDb {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// let db = SatoriDb::open("my_app")?;
+    /// ```rust,no_run
+    /// use satoridb::SatoriDb;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let _db = SatoriDb::open("my_app")?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn open(name: impl Into<String>) -> Result<Self> {
         SatoriDbBuilder::new(name).build()
@@ -183,11 +198,16 @@ impl SatoriDb {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// let db = SatoriDb::builder("my_app")
+    /// ```rust,no_run
+    /// use satoridb::SatoriDb;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let _db = SatoriDb::builder("my_app")
     ///     .workers(4)
     ///     .fsync_ms(100)
     ///     .build()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn builder(name: impl Into<String>) -> SatoriDbBuilder {
         SatoriDbBuilder::new(name)
@@ -204,8 +224,14 @@ impl SatoriDb {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// use satoridb::SatoriDb;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let db = SatoriDb::open("my_app")?;
     /// db.insert(1, vec![0.1, 0.2, 0.3])?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn insert(&self, id: u64, vector: Vec<f32>) -> Result<()> {
         block_on(self.handle.upsert(id, vector, None))?;
@@ -219,11 +245,29 @@ impl SatoriDb {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// use satoridb::SatoriDb;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let db = SatoriDb::open("my_app")?;
     /// db.delete(1)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn delete(&self, id: u64) -> Result<()> {
         block_on(self.handle.delete(id))
+    }
+
+    /// Run an aggressive rebalancing pass until no bucket exceeds the threshold.
+    ///
+    /// This call blocks and will use all CPU cores. It is best invoked when
+    /// ingestion is paused.
+    pub fn aggressive_rebalance(&self) -> Result<usize> {
+        ingest_control::disallow_ingestion();
+        thread::sleep(Duration::from_secs(10));
+        let result = self.rebalance_worker.aggressive_rebalance_blocking();
+        ingest_control::allow_ingestion();
+        result.map_err(|e| anyhow!(e))
     }
 
     /// Query for the nearest neighbors of a vector.
@@ -233,11 +277,17 @@ impl SatoriDb {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// use satoridb::SatoriDb;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let db = SatoriDb::open("my_app")?;
     /// let results = db.query(vec![0.1, 0.2, 0.3], 10)?;
     /// for (id, distance) in results {
     ///     println!("id={id} distance={distance}");
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn query(&self, vector: Vec<f32>, top_k: usize) -> Result<Vec<(u64, f32)>> {
         // Default probe count based on top_k, with sensible bounds
@@ -275,11 +325,17 @@ impl SatoriDb {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// use satoridb::SatoriDb;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let db = SatoriDb::open("my_app")?;
     /// let vectors = db.get(vec![1, 2, 3])?;
     /// for (id, vector) in vectors {
     ///     println!("id={id} vector={vector:?}");
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn get(&self, ids: Vec<u64>) -> Result<Vec<(u64, Vec<f32>)>> {
         block_on(self.handle.fetch_vectors_by_id(ids))

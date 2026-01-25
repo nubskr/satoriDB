@@ -30,7 +30,7 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 #[test]
 fn rebalance_fast_path_split_triggers_on_oversized_bucket() -> Result<()> {
     // Force split at 25
-    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "25");
+    let threshold = 25;
 
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
@@ -39,13 +39,15 @@ fn rebalance_fast_path_split_triggers_on_oversized_bucket() -> Result<()> {
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let bucket_locks = Arc::new(BucketLocks::new());
-    let worker = RebalanceWorker::spawn(
+    let worker = RebalanceWorker::spawn_with_threshold(
         storage.clone(),
         vector_index,
         bucket_index,
         routing.clone(),
         None,
         bucket_locks,
+        threshold,
+        100,
     );
 
     // Create one large bucket and prime centroids.

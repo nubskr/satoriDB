@@ -2,7 +2,6 @@ use crate::storage::wal::block::Entry;
 use crate::storage::wal::runtime::Walrus;
 use anyhow::Result;
 use rkyv::{Archive, Deserialize, Serialize};
-use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -194,15 +193,10 @@ impl Storage {
                     ranges.push((start, end));
                 }
 
-                for chunk in ranges.chunks(2000) {
-                    let mut slices: SmallVec<[&[u8]; 128]> = SmallVec::with_capacity(chunk.len());
-                    slices.extend(chunk.iter().map(|(s, e)| &backing[*s..*e]));
-                    wal.batch_append_for_topic(topic, &slices).map_err(|e| {
-                        anyhow::anyhow!(
-                            "Walrus batch append failed for bucket {}: {:?}",
-                            bucket_id,
-                            e
-                        )
+                for (s, e) in ranges.iter() {
+                    let slice = &backing[*s..*e];
+                    wal.append_for_topic(topic, slice).map_err(|e| {
+                        anyhow::anyhow!("Walrus append failed for bucket {}: {:?}", bucket_id, e)
                     })?;
                 }
                 Ok(())

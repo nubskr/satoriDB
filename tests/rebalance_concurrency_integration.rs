@@ -30,7 +30,7 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 #[test]
 fn routing_snapshots_survive_concurrent_split() -> Result<()> {
     // Force split with 10 vectors
-    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "5");
+    let threshold = 5;
 
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
@@ -39,13 +39,15 @@ fn routing_snapshots_survive_concurrent_split() -> Result<()> {
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let bucket_locks = Arc::new(BucketLocks::new());
-    let worker = RebalanceWorker::spawn(
+    let worker = RebalanceWorker::spawn_with_threshold(
         storage.clone(),
         vector_index,
         bucket_index,
         routing.clone(),
         None,
         bucket_locks,
+        threshold,
+        100,
     );
 
     // Prime with one bucket.

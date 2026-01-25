@@ -39,8 +39,11 @@ impl CleanMarkerStore {
                 HashMap::new()
             } else {
                 // SAFETY: file contents come from our previous rkyv serialization
+                // Copy to AlignedVec to ensure alignment.
+                let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
+                aligned.extend_from_slice(&bytes);
                 let archived =
-                    unsafe { rkyv::archived_root::<HashMap<String, CleanMarkerRecord>>(&bytes) };
+                    unsafe { rkyv::archived_root::<HashMap<String, CleanMarkerRecord>>(&aligned) };
                 archived
                     .deserialize(&mut rkyv::Infallible)
                     .unwrap_or_default()

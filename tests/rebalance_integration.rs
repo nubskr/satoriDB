@@ -31,7 +31,7 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 #[test]
 fn rebalance_split_increases_buckets_and_router_version() -> Result<()> {
     // Force aggressive splitting for test
-    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "10");
+    let threshold = 10;
 
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
@@ -40,13 +40,15 @@ fn rebalance_split_increases_buckets_and_router_version() -> Result<()> {
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let bucket_locks = Arc::new(BucketLocks::new());
-    let worker = RebalanceWorker::spawn(
+    let worker = RebalanceWorker::spawn_with_threshold(
         storage.clone(),
         vector_index,
         bucket_index,
         routing.clone(),
         None,
         bucket_locks,
+        threshold,
+        100,
     );
 
     // Persist a bucket with enough vectors to split.

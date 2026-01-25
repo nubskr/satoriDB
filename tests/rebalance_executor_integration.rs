@@ -31,7 +31,7 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 #[test]
 fn split_updates_routing_and_executor_results() -> Result<()> {
     // Force split on small buckets (8 vectors > 4)
-    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "4");
+    let threshold = 4;
 
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
@@ -40,13 +40,15 @@ fn split_updates_routing_and_executor_results() -> Result<()> {
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let bucket_locks = Arc::new(BucketLocks::new());
-    let worker = RebalanceWorker::spawn(
+    let worker = RebalanceWorker::spawn_with_threshold(
         storage.clone(),
         vector_index.clone(),
         bucket_index.clone(),
         routing.clone(),
         None,
         bucket_locks,
+        threshold,
+        100,
     );
 
     // One bucket containing two clear clusters: near (0,0) and near (100,100).
@@ -63,8 +65,12 @@ fn split_updates_routing_and_executor_results() -> Result<()> {
     // Autonomous loop should split bucket 0
 
     // Wait for routing to advance and for sizes to show multiple buckets.
+    // Also wait for rebalance to finish (total count settles back to 8).
+    // During streaming rebalance, we might see duplicates (transiently 16, then 12, then 8).
     let progressed = wait_until(Duration::from_secs(3), || {
-        worker.snapshot_sizes().len() > 1 && routing.current_version() > 0
+        let sizes = worker.snapshot_sizes();
+        let total: usize = sizes.values().sum();
+        sizes.len() > 1 && routing.current_version() > 0 && total == 8
     });
     assert!(progressed, "split did not finish in time");
 

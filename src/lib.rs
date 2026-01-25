@@ -99,6 +99,8 @@ pub mod gnd;
 #[doc(hidden)]
 pub mod indexer;
 #[doc(hidden)]
+pub mod ingest_control;
+#[doc(hidden)]
 pub mod ingest_counter;
 #[doc(hidden)]
 pub mod quantizer;
@@ -112,6 +114,8 @@ pub mod router;
 pub mod router_hnsw;
 #[doc(hidden)]
 pub mod router_manager;
+#[doc(hidden)]
+pub mod s3_reader;
 #[doc(hidden)]
 pub mod service;
 #[doc(hidden)]

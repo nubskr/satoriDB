@@ -1,8 +1,10 @@
+.env
 /.tmp
-/vector_index
 *.f32bin
 *.svg
 perf.*
+bucket_index/
+vector_index/
 wal_files/
 gist/
 satori_data/

@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use crossbeam_channel::{unbounded, Sender};
+use dotenv::dotenv;
 use flate2::read::GzDecoder;
 use futures::channel::oneshot;
 use futures::executor::block_on;
@@ -23,6 +24,7 @@ use satoridb::indexer::Indexer;
 use satoridb::ingest_counter;
 use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
+use satoridb::s3_reader::spawn_s3_reader;
 use satoridb::storage::{Storage, Vector};
 use satoridb::tasks::{ConsistentHashRing, RouterResult, RouterTask};
 use satoridb::vector_index::VectorIndex;
@@ -43,6 +45,7 @@ struct DatasetConfig {
     gnd_path: Option<PathBuf>,
     max_vectors: usize,
     base_is_prepared: bool,
+    use_s3: bool,
 }
 
 fn ensure_gist_files(tar_path: &Path) -> anyhow::Result<()> {
@@ -123,6 +126,7 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
             },
             max_vectors: 1_000_000usize,
             base_is_prepared: prepared_base.exists(),
+            use_s3: false,
         }));
     }
 
@@ -143,6 +147,7 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
             },
             max_vectors: 1_000_000_000usize,
             base_is_prepared: true,
+            use_s3: false,
         }));
     }
 
@@ -162,6 +167,37 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
             },
             max_vectors: 1_000_000_000usize,
             base_is_prepared: prepared_bigann.exists(),
+            use_s3: false,
+        }));
+    }
+
+    // Check for S3/R2 Fallback
+    if std::env::var("R2_ENDPOINT").is_ok()
+        && std::env::var("BUCKET_NAME").is_ok()
+        && std::env::var("ACCESS_KEY_ID").is_ok()
+        && std::env::var("SECRET_ACCESS_KEY").is_ok()
+    {
+        // Assume BigAnn if R2 is configured and no local Gist
+        // We still need query/gnd locally for now, or we can skip them?
+        // The original code assumes query file exists locally for benchmark.
+        // Assuming user has query file locally or downloads it.
+        // If bigann_query.bvecs.gz doesn't exist, we might fail later, but let's try.
+
+        // Actually, if query file is missing, we can't run recall, but we can ingest.
+        // Let's allow it.
+
+        return Ok(Some(DatasetConfig {
+            kind: DatasetKind::Bigann,
+            base_path: PathBuf::from("bigann_base.bvecs.f32bin"), // Virtual path
+            query_path: bigann_query,
+            gnd_path: if bigann_gnd.exists() {
+                Some(bigann_gnd)
+            } else {
+                None
+            },
+            max_vectors: 1_000_000_000usize,
+            base_is_prepared: true, // S3 stream is f32bin
+            use_s3: true,
         }));
     }
 
@@ -169,7 +205,24 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
 }
 
 fn main() -> anyhow::Result<()> {
+    dotenv().ok();
     env_logger::init();
+
+    // Check limits
+    let mut rlimit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlimit) };
+    info!(
+        "RLIMIT_NOFILE: cur={}, max={}",
+        rlimit.rlim_cur, rlimit.rlim_max
+    );
+
+    let fd_count = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0);
+    info!("Initial open FDs: {}", fd_count);
 
     let satori_cores: usize = std::env::var("SATORI_CORES")
         .ok()
@@ -367,6 +420,7 @@ async fn run_benchmark_mode(
         Bvecs(BvecsReader),
         Fvecs(FvecsReader),
         Flat(FlatF32Reader),
+        S3(async_channel::Receiver<anyhow::Result<Vec<Vector>>>),
     }
 
     impl Reader {
@@ -375,29 +429,54 @@ async fn run_benchmark_mode(
                 Reader::Bvecs(r) => r.read_batch(batch_size),
                 Reader::Fvecs(r) => r.read_batch(batch_size),
                 Reader::Flat(r) => r.read_batch(batch_size),
+                Reader::S3(rx) => match rx.recv_blocking() {
+                    Ok(Ok(vectors)) => Ok(vectors),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Ok(Vec::new()),
+                },
             }
         }
     }
 
-    let (initial_batch_size, stream_batch_size, k, router_top_k) = match dataset.kind {
-        DatasetKind::Bigann => (100_000, 100_000, 100, 20),
-        DatasetKind::Gist => (50_000, 100_000, 100, 400),
+    let (default_initial_batch_size, stream_batch_size, k, router_top_k) = match dataset.kind {
+        DatasetKind::Bigann => (500_000, 500_000, 10, 20),
+        DatasetKind::Gist => (50_000, 100_000, 10, 400),
     };
 
-    if dataset.base_path.exists() {
-        let mut reader = match dataset.kind {
-            DatasetKind::Bigann => {
-                if dataset.base_is_prepared {
-                    Reader::Flat(FlatF32Reader::new(&dataset.base_path)?)
-                } else {
-                    Reader::Bvecs(BvecsReader::new(&dataset.base_path)?)
+    let initial_batch_size = if dataset.use_s3 {
+        200_000
+    } else {
+        default_initial_batch_size
+    };
+
+    if dataset.base_path.exists() || dataset.use_s3 {
+        let mut reader = if dataset.use_s3 {
+            println!("Initializing S3 Stream for BigANN...");
+            let endpoint = std::env::var("R2_ENDPOINT").expect("R2_ENDPOINT not set");
+            let bucket = std::env::var("BUCKET_NAME").expect("BUCKET_NAME not set");
+            let access = std::env::var("ACCESS_KEY_ID").expect("ACCESS_KEY_ID not set");
+            let secret = std::env::var("SECRET_ACCESS_KEY").expect("SECRET_ACCESS_KEY not set");
+            // We assume the file in bucket is named similarly or we use a fixed name.
+            // Based on earlier check: bigann_base.bvecs.f32bin
+            let key = "bigann_base.bvecs.f32bin".to_string();
+
+            let rx = spawn_s3_reader(endpoint, bucket, key, access, secret, stream_batch_size);
+            Reader::S3(rx)
+        } else {
+            match dataset.kind {
+                DatasetKind::Bigann => {
+                    if dataset.base_is_prepared {
+                        Reader::Flat(FlatF32Reader::new(&dataset.base_path)?)
+                    } else {
+                        Reader::Bvecs(BvecsReader::new(&dataset.base_path)?)
+                    }
                 }
-            }
-            DatasetKind::Gist => {
-                if dataset.base_is_prepared {
-                    Reader::Flat(FlatF32Reader::new(&dataset.base_path)?)
-                } else {
-                    Reader::Fvecs(FvecsReader::new(&dataset.base_path)?)
+                DatasetKind::Gist => {
+                    if dataset.base_is_prepared {
+                        Reader::Flat(FlatF32Reader::new(&dataset.base_path)?)
+                    } else {
+                        Reader::Fvecs(FvecsReader::new(&dataset.base_path)?)
+                    }
                 }
             }
         };

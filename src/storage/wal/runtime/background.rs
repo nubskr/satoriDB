@@ -172,8 +172,8 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
 
             // Phase 5: Periodic cleanup
             let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
-            if n >= 1000 {
-                // WARN: we clean up once every 1000 times the fsync runs
+            if n >= 1 {
+                // WARN: we clean up aggressively (every tick) to prevent disk fill
                 if tick
                     .compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()

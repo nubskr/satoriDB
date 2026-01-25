@@ -33,8 +33,11 @@ impl WalIndex {
                     return None;
                 }
                 // SAFETY: `bytes` comes from our persisted index file which we control;
-                // we only proceed when the file is non-empty and rkyv can interpret it.
-                let archived = unsafe { rkyv::archived_root::<HashMap<String, BlockPos>>(&bytes) };
+                // we copy into `AlignedVec` to ensure alignment requirements are met.
+                let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
+                aligned.extend_from_slice(&bytes);
+                let archived =
+                    unsafe { rkyv::archived_root::<HashMap<String, BlockPos>>(&aligned) };
                 archived.deserialize(&mut rkyv::Infallible).ok()
             })
             .unwrap_or_default();

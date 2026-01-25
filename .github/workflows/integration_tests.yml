@@ -45,3 +45,7 @@ jobs:
           cargo test --test worker_end_to_end
           cargo test --test rebalance_concurrency_integration
           cargo test --test embedded_smoke
+          cargo test --test example_embedded_async
+          cargo test --test example_api_tour
+          cargo test --test query_with_vectors
+          cargo test --test fetch_vectors

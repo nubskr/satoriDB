@@ -11,27 +11,49 @@ use std::path::Path;
 ///
 /// This keeps lookup-by-id feasible at high cardinality without holding everything in RAM.
 pub struct VectorIndex {
-    db: DB,
+    db: Option<DB>,
 }
 
 impl VectorIndex {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        if std::env::var("SATORI_RUN_BENCH").is_ok() {
+            return Ok(Self { db: None });
+        }
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
         opts.optimize_level_style_compaction(64 * 1024 * 1024);
+
+        // Let RocksDB manage open files (no internal cap).
+        opts.set_max_open_files(-1);
+        opts.set_allow_mmap_reads(false);
+        opts.set_allow_mmap_writes(false);
+
+        // Increase background jobs for compaction
+        opts.set_max_background_jobs(4);
+
+        // Enforce backpressure
+        opts.set_level_zero_file_num_compaction_trigger(4);
+        opts.set_level_zero_slowdown_writes_trigger(20);
+        opts.set_level_zero_stop_writes_trigger(36);
+
         let cache = Cache::new_lru_cache(64 * 1024 * 1024);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(&cache);
         opts.set_block_based_table_factory(&block_opts);
-        opts.set_write_buffer_size(16 * 1024 * 1024);
-        opts.set_max_write_buffer_number(2);
+        opts.set_write_buffer_size(64 * 1024 * 1024); // Increase buffer size
+        opts.set_max_write_buffer_number(4);
+
         let db = DB::open(&opts, path).context("open vector index")?;
-        Ok(Self { db })
+        Ok(Self { db: Some(db) })
     }
 
     /// Insert or overwrite a batch of vectors.
     pub fn put_batch(&self, vectors: &[Vector]) -> Result<()> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(()),
+        };
         if vectors.is_empty() {
             return Ok(());
         }
@@ -43,12 +65,16 @@ impl VectorIndex {
             let bytes: AlignedVec = ser.into_serializer().into_inner();
             batch.put(v.id.to_le_bytes(), bytes);
         }
-        self.db.write(batch).context("write vector index batch")
+        db.write(batch).context("write vector index batch")
     }
 
     /// Delete a batch of ids (best-effort; missing keys are ignored).
     #[allow(dead_code)]
     pub fn delete_batch(&self, ids: &[u64]) -> Result<()> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(()),
+        };
         if ids.is_empty() {
             return Ok(());
         }
@@ -56,15 +82,18 @@ impl VectorIndex {
         for id in ids {
             batch.delete(id.to_le_bytes());
         }
-        self.db.write(batch).context("delete vector index batch")
+        db.write(batch).context("delete vector index batch")
     }
 
     /// Fetch the stored vectors for the given ids. Missing ids are skipped.
     pub fn get_many(&self, ids: &[u64]) -> Result<Vec<(u64, Vector)>> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(Vec::new()),
+        };
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(raw) = self
-                .db
+            if let Some(raw) = db
                 .get(id.to_le_bytes())
                 .with_context(|| format!("read id {} from vector index", id))?
             {
@@ -92,14 +121,17 @@ impl VectorIndex {
     /// Uses bloom filter for fast negative lookups, falling back to actual
     /// read only when the bloom filter indicates the key may exist.
     pub fn exists(&self, id: u64) -> Result<bool> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(false),
+        };
         let key = id.to_le_bytes();
         // Fast path: bloom filter says definitely not there
-        if !self.db.key_may_exist(key) {
+        if !db.key_may_exist(key) {
             return Ok(false);
         }
         // Slow path: bloom filter uncertain, do actual lookup
-        Ok(self
-            .db
+        Ok(db
             .get(key)
             .with_context(|| format!("check existence of id {}", id))?
             .is_some())

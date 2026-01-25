@@ -3,7 +3,7 @@ use parking_lot::Mutex as MapMutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Shared per-bucket locks used to serialize worker writes and rebalancer splits/merges.
+/// Shared per-bucket locks used to serialize worker writes and deletes.
 pub struct BucketLocks {
     map: MapMutex<HashMap<u64, Arc<Mutex<()>>>>,
 }
